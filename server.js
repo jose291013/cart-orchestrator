@@ -1,8 +1,21 @@
 import express from "express";
 import axios from "axios";
+import cors from "cors";
+
 
 const app = express();
 app.use(express.json({ limit: "5mb" }));
+app.use(cors({
+  origin: [
+    "https://decoration.ams.v6.pressero.com"
+  ],
+  methods: ["GET","POST","OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+  credentials: false
+}));
+
+// Optionnel : répondre explicitement au preflight
+app.options("*", cors());
 
 // --- ENV ---
 const ADMIN_URL = process.env.PRESSERO_ADMIN_URL || "https://admin.ams.v6.pressero.com";
