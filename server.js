@@ -46,6 +46,38 @@ function api(token) {
   });
 }
 
+// ✅ Resolve ProductId from UrlName (brochure-dist, etc.)
+async function resolveProductId(client, urlName) {
+  const r = await client.post(
+    `/api/site/${SITE_DOMAIN}/products`,
+    [
+      {
+        Column: "UrlName",
+        Value: urlName,
+        Operator: "isequalto"
+      }
+    ],
+    {
+      params: {
+        pageNumber: 0,
+        pageSize: 1,
+        includeDeleted: false
+      }
+    }
+  );
+
+  const item = r?.data?.Items?.[0];
+  const productId = item?.ProductId;
+
+  if (!productId) {
+    throw new Error("ProductId introuvable pour UrlName=" + urlName);
+  }
+
+  console.log("✅ ProductId résolu :", productId);
+  return productId;
+}
+
+
 // --- utils ---
 function norm(s) {
   return (s || "").toString().trim().toLowerCase()
@@ -169,29 +201,40 @@ app.post("/validate-addresses", async (req, res) => {
 // 2) Add to cart: 1 adresse = 1 item
 app.post("/add-to-cart-distribution", async (req, res) => {
   try {
-    const { userEmail, productId, shippingMethod, pricingOptions, validatedList } = req.body || {};
+    const {
+      userEmail,
+      urlName,              // ✅ au lieu de productId
+      shippingMethod,
+      pricingOptions,
+      validatedList
+    } = req.body || {};
 
-    if (!userEmail || !productId || !shippingMethod) {
-      return res.status(400).json({ error: "userEmail, productId, shippingMethod requis" });
-    }
-    if (!Array.isArray(pricingOptions) || !pricingOptions.length) {
-      return res.status(400).json({ error: "pricingOptions requis" });
-    }
-    if (!Array.isArray(validatedList) || !validatedList.length) {
-      return res.status(400).json({ error: "validatedList requis" });
-    }
+    if (!userEmail || !urlName || !shippingMethod)
+      return res.status(400).json({ error: "userEmail, urlName, shippingMethod requis" });
 
+    if (!Array.isArray(pricingOptions) || !pricingOptions.length)
+      return res.status(400).json({ error: "pricingOptions manquant" });
+
+    if (!Array.isArray(validatedList) || !validatedList.length)
+      return res.status(400).json({ error: "validatedList manquant" });
+
+    // ✅ Auth
     const token = await authenticate();
     const client = api(token);
 
+    // ✅ UserId + CartId
     const userId = await getUserId(client, userEmail);
     const cartId = await getCartId(client, userId);
 
+    // ✅ Resolve productId automatiquement
+    const productId = await resolveProductId(client, urlName);
+
     const results = [];
+
+    // ✅ Boucle : 1 adresse = 1 ligne panier
     for (const row of validatedList) {
       const qty = parseInt(row.qty, 10) || 0;
-      if (qty <= 0) continue;
-      if (!row.addressId) throw new Error("addressId manquant dans validatedList");
+      if (!qty) continue;
 
       const payload = {
         ProductId: productId,
@@ -202,7 +245,7 @@ app.post("/add-to-cart-distribution", async (req, res) => {
           Options: pricingOptions
         },
         ItemName: "Distribution",
-        Notes: `Distribution -> ${row.address} | ${row.zip} | ${row.city}`
+        Notes: `${row.address} | ${row.zip} | ${row.city}`
       };
 
       const r = await client.post(
@@ -211,16 +254,26 @@ app.post("/add-to-cart-distribution", async (req, res) => {
         { params: { userId } }
       );
 
-      results.push({ addressId: row.addressId, qty, status: r.status });
+      results.push({
+        addressId: row.addressId,
+        qty,
+        status: r.status
+      });
     }
 
-    res.json({ ok: true, cartId, added: results.length, results });
+    res.json({
+      ok: true,
+      cartId,
+      added: results.length,
+      results
+    });
 
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: e.message || "Erreur" });
+    res.status(500).json({ error: e.message });
   }
 });
+
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log(`cart-orchestrator listening on :${port}`));
