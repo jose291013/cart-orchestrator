@@ -202,6 +202,55 @@ async function createAddress(client, siteDomain, userId, addr, template) {
 
   return found?.AddressId || null;
 }
+async function upsertAddress(client, siteDomain, userId, addr) {
+  const payload = {
+    Business: addr.Business || "Distribution",
+    FirstName: addr.FirstName || "Client",
+    LastName: addr.LastName || "Distribution",
+    Title: addr.Title || undefined,
+    Address1: addr.Address1,
+    Address2: addr.Address2 || undefined,
+    Address3: addr.Address3 || undefined,
+    City: addr.City,
+    StateProvince: addr.StateProvince || "NA",
+    Postal: addr.Postal,
+    Country: (addr.Country || "FR").toUpperCase(),
+    Phone: addr.Phone || "",
+    Email: addr.Email || ""
+  };
+
+  // ✅ Si AddressId présent → tentative d’update
+  if (addr.AddressId) {
+    try {
+      // Route la plus logique (à tester). Si Pressero utilise PATCH/PUT ailleurs, on fallback.
+      await client.put(`/api/site/${siteDomain}/Addressbook/${userId}/${addr.AddressId}`, payload);
+      return addr.AddressId;
+    } catch (e) {
+      const st = e?.response?.status;
+      // 404/405 = endpoint update pas supporté ou pas trouvé → on tente création
+      if (st !== 404 && st !== 405) throw e;
+    }
+  }
+
+  // ✅ Sinon (ou fallback) → création
+  const r = await client.post(`/api/site/${siteDomain}/Addressbook/${userId}/`, payload);
+
+  // si l’API renvoie un AddressId direct on le prend, sinon on rematch
+  const directId = r?.data?.AddressId || r?.data?.Id || null;
+  if (directId) return directId;
+
+  const ab2 = await getAddressBook(client, siteDomain, userId);
+  const key = `${norm(payload.Address1)}|${norm(payload.Postal)}|${norm(payload.City)}|${norm(payload.Business)}`;
+  const all = [ab2?.PreferredAddress, ...(ab2?.Addresses || [])].filter(Boolean);
+
+  const found = all.find(a => {
+    const k = `${norm(a?.Address1)}|${norm(a?.Postal)}|${norm(a?.City)}|${norm(a?.Business)}`;
+    return k === key;
+  });
+
+  return found?.AddressId || null;
+}
+
 
 // 1) Validate addresses: existe ? sinon créer -> retourner addressId
 app.post("/validate-addresses", async (req, res) => {
@@ -259,18 +308,31 @@ app.post("/addressbook/list", async (req, res) => {
     const token = await authenticate();
     const client = api(token);
 
-    const userId = await getUserId(client, sd, userEmail); // si ton getUserId n'a pas sd, laisse tel quel
+    const userId = await getUserId(client, sd, userEmail);
     const r = await client.get(`/api/site/${sd}/Addressbook/${userId}`);
 
     const preferred = r?.data?.PreferredAddress || null;
     const addresses = r?.data?.Addresses || [];
 
-    res.json({ ok: true, preferred, addresses });
+    // ✅ dédoublonnage par AddressId (Preferred peut aussi être dans Addresses)
+    const map = new Map();
+    for (const a of [preferred, ...addresses].filter(Boolean)) {
+      const id = a?.AddressId;
+      if (id && !map.has(id)) map.set(id, a);
+    }
+    const unique = [...map.values()];
+
+    res.json({
+      ok: true,
+      preferredId: preferred?.AddressId || null,
+      addresses: unique
+    });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: e.message || "Erreur" });
   }
 });
+
 app.post("/addressbook/import", async (req, res) => {
   try {
     const { userEmail, siteDomain, newAddresses } = req.body || {};
@@ -302,6 +364,7 @@ app.post("/addressbook/import", async (req, res) => {
 
     for (const a of newAddresses) {
       const addr = {
+        AddressId: (a.AddressId || "").trim() || undefined,
         Business: (a.Business || "").trim(),
         FirstName: (a.FirstName || "").trim() || undefined,
         LastName: (a.LastName || "").trim() || undefined,
@@ -328,8 +391,9 @@ app.post("/addressbook/import", async (req, res) => {
         continue;
       }
 
-      const r = await client.post(`/api/site/${sd}/Addressbook/${userId}/`, addr);
-      created.push({ addr, result: r?.data });
+      const addressId = await upsertAddress(client, sd, userId, addr);
+      created.push({ addr, addressId });
+
       existingKeys.add(k);
     }
 
