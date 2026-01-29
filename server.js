@@ -202,7 +202,7 @@ app.post("/validate-addresses", async (req, res) => {
     const token = await authenticate();
     const client = api(token);
 
-    const userId = await getUserId(client, userEmail);
+    const userId = await getUserId(client, sd, userEmail);
     const ab = await getAddressBook(client, userId);
 
     const preferred = ab?.PreferredAddress;
@@ -244,7 +244,7 @@ app.post("/addressbook/list", async (req, res) => {
     const token = await authenticate();
     const client = api(token);
 
-    const userId = await getUserId(client, userEmail, sd); // si ton getUserId n'a pas sd, laisse tel quel
+    const userId = await getUserId(client, sd, userEmail); // si ton getUserId n'a pas sd, laisse tel quel
     const r = await client.get(`/api/site/${sd}/Addressbook/${userId}`);
 
     const preferred = r?.data?.PreferredAddress || null;
@@ -268,7 +268,7 @@ app.post("/addressbook/import", async (req, res) => {
     const token = await authenticate();
     const client = api(token);
 
-    const userId = await getUserId(client, userEmail, sd);
+    const userId = await getUserId(client, sd, userEmail);
 
     // Load existing addressbook to dedupe
     const ab = await client.get(`/api/site/${sd}/Addressbook/${userId}`);
@@ -333,7 +333,7 @@ app.get("/addressbook/export.csv", async (req, res) => {
     const token = await authenticate();
     const client = api(token);
 
-    const userId = await getUserId(client, userEmail, sd);
+    const userId = await getUserId(client, sd, userEmail);
 
     const r = await client.get(`/api/site/${sd}/Addressbook/${userId}`);
     const preferred = r?.data?.PreferredAddress ? [{ ...r.data.PreferredAddress, IsPreferred: true }] : [];
