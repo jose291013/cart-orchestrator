@@ -108,6 +108,7 @@ function mergeDuplicates(list) {
   for (const row of list || []) {
     const qty = parseInt(row.qty, 10) || 0;
     if (qty <= 0) continue;
+
     const key = addrKey(row);
     if (!key || key === "||") continue;
 
@@ -116,6 +117,7 @@ function mergeDuplicates(list) {
   }
   return [...map.values()];
 }
+
 
 // --- basic ---
 app.get("/health", (req,res)=> res.json({ ok:true }));
@@ -231,6 +233,10 @@ app.post("/add-to-cart-distribution", async (req, res) => {
     if (!Array.isArray(validatedList) || !validatedList.length)
       return res.status(400).json({ error: "validatedList manquant" });
 
+    const { otherQuantities } = req.body || {};
+    const oq = Array.isArray(otherQuantities) ? otherQuantities : [];
+
+
     // ✅ Auth
     const token = await authenticate();
     const client = api(token);
@@ -248,38 +254,64 @@ app.post("/add-to-cart-distribution", async (req, res) => {
     for (const row of validatedList) {
       const qty = parseInt(row.qty, 10) || 0;
       if (!qty) continue;
+      const quantities = [qty, ...oq]; // qty = exemplaires par adresse, puis pages etc.
 
       const payload = {
         ProductId: productId,
         ShipTo: row.addressId,
         ShippingMethod: shippingMethod,
         PricingParameters: {
-          Quantities: [qty, 1],
-          Options: pricingOptions
-        },
+        Quantities: quantities,
+        Options: pricingOptions
+    },
         ItemName: "Distribution",
         Notes: `${row.address} | ${row.zip} | ${row.city}`
       };
+      
 
-      const r = await client.post(
-        `/api/cart/${SITE_DOMAIN}/${cartId}/item/`,
-        payload,
-        { params: { userId } }
-      );
 
-      results.push({
-        addressId: row.addressId,
-        qty,
-        status: r.status
-      });
+      try {
+  const r = await client.post(
+    `/api/cart/${SITE_DOMAIN}/${cartId}/item/`,
+    payload,
+    { params: { userId } }
+  );
+
+  results.push({ addressId: row.addressId, qty, status: r.status, ok: true });
+
+} catch (err) {
+  const status = err?.response?.status;
+  const msg = err?.response?.data?.Message || err?.response?.data?.message || err?.message;
+
+  // ✅ Pressero renvoie parfois un 400 "warning" de prix
+  if (status === 400 && msg === "ReOrderFullSuccess_PriceWarning") {
+    results.push({
+      addressId: row.addressId,
+      qty,
+      status,
+      ok: true,
+      warning: msg
+    });
+    continue;
+  }
+
+  // ❌ vraie erreur
+  throw err;
+}
+
     }
 
-    res.json({
-      ok: true,
-      cartId,
-      added: results.length,
-      results
-    });
+    const added = results.filter(r => r.ok).length;
+const warnings = results.filter(r => r.warning).length;
+
+res.json({
+  ok: true,
+  cartId,
+  added,
+  warnings,
+  results
+});
+
 
   } catch (e) {
     console.error(e);
