@@ -1,6 +1,8 @@
 import express from "express";
 import axios from "axios";
 import cors from "cors";
+import ExcelJS from "exceljs";
+
 
 
 const app = express();
@@ -377,6 +379,95 @@ app.get("/addressbook/export.csv", async (req, res) => {
     res.setHeader("Content-Type", "text/csv; charset=utf-8");
     res.setHeader("Content-Disposition", 'attachment; filename="addressbook.csv"');
     res.send(csv);
+  } catch (e) {
+    console.error(e);
+    res.status(500).send(e.message || "Erreur");
+  }
+});
+app.get("/addressbook/export.xlsx", async (req, res) => {
+  try {
+    const { userEmail, siteDomain } = req.query || {};
+    if (!userEmail) return res.status(400).send("userEmail requis");
+    const sd = assertSiteDomain(siteDomain);
+
+    const token = await authenticate();
+    const client = api(token);
+
+    const userId = await getUserId(client, sd, userEmail);
+
+    const r = await client.get(`/api/site/${sd}/Addressbook/${userId}`);
+    const preferred = r?.data?.PreferredAddress
+      ? [{ ...r.data.PreferredAddress, IsPreferred: true }]
+      : [];
+    const addresses = (r?.data?.Addresses || []).map(a => ({ ...a, IsPreferred: false }));
+
+    const rows = [...preferred, ...addresses].map(a => ({
+      AddressId: a.AddressId || "",
+      Business: a.Business || "",
+      FirstName: a.FirstName || "",
+      LastName: a.LastName || "",
+      Title: a.Title || "",
+      Address1: a.Address1 || "",
+      Address2: a.Address2 || "",
+      Address3: a.Address3 || "",
+      City: a.City || "",
+      StateProvince: a.StateProvince || "",
+      Postal: a.Postal || "",
+      Country: a.Country || "",
+      Phone: a.Phone || "",
+      Email: a.Email || "",
+      IsPreferred: a.IsPreferred ? "true" : "false",
+      Qty: "" // colonne vide à remplir
+    }));
+
+    const wb = new ExcelJS.Workbook();
+    wb.creator = "cart-orchestrator";
+    wb.created = new Date();
+
+    const ws = wb.addWorksheet("Addressbook", {
+      views: [{ state: "frozen", ySplit: 1 }]
+    });
+
+    ws.columns = [
+      { header: "AddressId", key: "AddressId", width: 36 },
+      { header: "Business", key: "Business", width: 24 },
+      { header: "FirstName", key: "FirstName", width: 16 },
+      { header: "LastName", key: "LastName", width: 16 },
+      { header: "Title", key: "Title", width: 16 },
+      { header: "Address1", key: "Address1", width: 34 },
+      { header: "Address2", key: "Address2", width: 22 },
+      { header: "Address3", key: "Address3", width: 22 },
+      { header: "City", key: "City", width: 18 },
+      { header: "StateProvince", key: "StateProvince", width: 18 },
+      { header: "Postal", key: "Postal", width: 12 },
+      { header: "Country", key: "Country", width: 10 },
+      { header: "Phone", key: "Phone", width: 18 },
+      { header: "Email", key: "Email", width: 26 },
+      { header: "IsPreferred", key: "IsPreferred", width: 12 },
+      { header: "Qty", key: "Qty", width: 10 }
+    ];
+
+    // Style header
+    ws.getRow(1).font = { bold: true };
+    ws.getRow(1).alignment = { vertical: "middle" };
+    ws.getRow(1).height = 18;
+
+    // Ajout des lignes
+    ws.addRows(rows);
+
+    // Content headers
+    res.setHeader(
+      "Content-Type",
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    );
+    res.setHeader(
+      "Content-Disposition",
+      'attachment; filename="addressbook.xlsx"'
+    );
+
+    // Écriture streaming vers la réponse
+    await wb.xlsx.write(res);
+    res.end();
   } catch (e) {
     console.error(e);
     res.status(500).send(e.message || "Erreur");
