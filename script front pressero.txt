@@ -1,5 +1,3 @@
-<!-- START DISTRIBUTION LIST – BROCHURE-DIST -->
-
 <script src="https://cdn.jsdelivr.net/npm/papaparse@5.3.2/papaparse.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 
@@ -7,410 +5,366 @@
 ;(function(){
   if (!window.location.pathname.includes('/product/brochure-dist')) return;
 
-  // ========= CONFIG =========
-  const RENDER_BASE = "https://cart-orchestrator.onrender.com"; // <-- TODO: mets ton URL Render
-  const ENDPOINT_VALIDATE = `${RENDER_BASE}/validate-addresses`;
-  const ENDPOINT_ADD_CART = `${RENDER_BASE}/add-to-cart-distribution`;
+  const RENDER_BASE = "https://cart-orchestrator.onrender.com";
+  const END_LIST   = `${RENDER_BASE}/addressbook/list`;
+  const END_IMPORT = `${RENDER_BASE}/addressbook/import`;
+  const END_EXPORT = `${RENDER_BASE}/addressbook/export.csv`;
+  const END_ADD    = `${RENDER_BASE}/add-to-cart-distribution`;
 
-  // shipping method id (à définir)
-  const SHIPPING_METHOD_ID = "e4080000-568f-0050-4d3d-08da0cdc8a47"; // <-- TODO si besoin
-
-  // UrlName du produit (utilisé par ton serveur pour resolveProductId)
   const URL_NAME = "brochure-dist";
+  const SHIPPING_METHOD_ID = "e4080000-568f-0050-4d3d-08da0cdc8a47"; // <-- mets le bon
 
-  // Upload slot à conserver (optionnel)
-  const FILE_UPLOAD_ID = "fileUploads[2]";
-
-  // ========= STATE =========
-  let validatedList = null;
-
-  // ========= DOM helpers =========
   function getUserEmail(){
     return (document.getElementById("correo")?.textContent || "").trim();
   }
   function getSiteDomain(){
-    return (document.getElementById("tienda")?.textContent || "").trim();
+    return (document.getElementById("tienda")?.textContent || location.host || "").trim();
   }
 
   function escapeHtml(s){
-    return (s ?? '').toString()
+    return (s ?? "").toString()
       .replace(/&/g,'&amp;').replace(/</g,'&lt;')
       .replace(/>/g,'&gt;').replace(/"/g,'&quot;')
       .replace(/'/g,'&#039;');
   }
 
-  function debounce(fn, wait){
-    let t;
-    return function(){
-      clearTimeout(t);
-      t = setTimeout(()=>fn(), wait);
-    };
-  }
-
-  // ========= Dedupe helpers =========
-  function norm(s) {
-    return (s || '')
-      .toString()
-      .trim()
-      .toLowerCase()
-      .replace(/\s+/g,' ')
-      .replace(/[’']/g,"'")
-      .replace(/[.,;]+/g,' ')
-      .replace(/\s+/g,' ')
-      .trim();
-  }
-
-  function addressKey({address, zip, city}) {
-    return [norm(address), norm(zip), norm(city)].join('|');
-  }
-
-  function mergeDuplicates(list) {
-  const map = new Map();
-  for (const row of list || []) {
-    const qty = parseInt(row.qty, 10) || 0;
-    if (qty <= 0) continue;
-
-    const key = addressKey(row);
-    if (!key || key === '||') continue;
-
-    if (!map.has(key)) map.set(key, { ...row, qty });
-    else map.get(key).qty += qty;
-  }
-  return [...map.values()];
-}
-
-
-  // ========= UI message =========
-  function showMsg(txt, type="info"){
-    const el = document.getElementById("distMsg");
-    if (!el) return;
-    if (!txt) { el.style.display="none"; el.textContent=""; return; }
-    el.style.display="block";
-    el.textContent = txt;
-    el.className = "dist-msg " + type;
-  }
-
-  // ========= Calculator options reader (Pressero DOM) =========
-  // Options[i].Key (hidden) + Options[i].Value (select) :contentReference[oaicite:1]{index=1}
   function readPricingOptionsFromDOM(){
-  const opts = [];
-  const keyInputs = [...document.querySelectorAll('input[type="hidden"][id^="Options["][id$="].Key"]')];
-
-  for (const keyEl of keyInputs) {
-    const m = keyEl.id.match(/^Options\[(\d+)\]\.Key$/);
-    if (!m) continue;
-
-    const idx = m[1];
-    const key = keyEl.value;
-
-    const valEl = document.querySelector(`#Options\\[${idx}\\]\\.Value`);
-    const value = valEl ? (valEl.value ?? '') : '';
-
-    if (key) opts.push({ Key: key, Value: value });
-  }
-  return opts;
-}
-
-
-  // ========= Table read/write =========
-  function getListRawFromTable() {
-  return [...document.querySelectorAll('#distTable tbody tr')]
-    .map(tr => ({
-      address: tr.querySelector('.dist-address')?.value.trim() || '',
-      zip:     tr.querySelector('.dist-zip')?.value.trim() || '',
-      city:    tr.querySelector('.dist-city')?.value.trim() || '',
-      qty:     parseInt(tr.querySelector('.dist-qty')?.value, 10) || 0
-    }))
-    .filter(r => (r.address || r.zip || r.city) && r.qty > 0);
-}
-
-
-  function repaintTableFromList(list) {
-    const tb = document.querySelector('#distTable tbody');
-    tb.innerHTML = '';
-    list.forEach(r => addRow(r.address, r.zip, r.city, r.qty, {skipSave:true}));
-    saveList();
-  }
-
-  function saveList() {
-    const raw = getListRawFromTable();
-    const merged = mergeDuplicates(raw);
-
-    // si doublons -> on fusionne automatiquement
-    if (raw.length && merged.length < raw.length) {
-      showMsg(`Doublons détectés : ${raw.length - merged.length} ligne(s) fusionnée(s).`, "ok");
-      repaintTableFromList(merged);
-      return;
+    const opts = [];
+    const keyInputs = [...document.querySelectorAll('input[type="hidden"][id^="Options["][id$="].Key"]')];
+    for (const keyEl of keyInputs) {
+      const m = keyEl.id.match(/^Options\[(\d+)\]\.Key$/);
+      if (!m) continue;
+      const idx = m[1];
+      const key = keyEl.value;
+      const valEl = document.querySelector(`#Options\\[${idx}\\]\\.Value`);
+      const value = valEl ? (valEl.value ?? '') : '';
+      if (key && value !== "" && value != null) opts.push({ Key: key, Value: value });
     }
-
-    localStorage.setItem("dist_list_cache", JSON.stringify(merged));
-    validatedList = null;
-    const btnCart = document.getElementById("addToCartDistBtn");
-    if (btnCart) btnCart.disabled = true;
+    return opts;
   }
 
-  function addRow(a='', z='', c='', q='', opts={}) {
-    const tr = document.createElement('tr');
-    tr.innerHTML = `
-      <td><input class="dist-address" value="${escapeHtml(a)}" placeholder="Adresse complète"></td>
-      <td><input class="dist-zip" value="${escapeHtml(z)}" placeholder="Code postal"></td>
-      <td><input class="dist-city" value="${escapeHtml(c)}" placeholder="Ville"></td>
-      <td style="width:140px;"><input class="dist-qty" type="number" min="1" value="${escapeHtml(String(q))}" placeholder="1"></td>
-      <td class="dist-actions"><button class="removeRowBtn" type="button">Supprimer</button></td>
-    `;
-    document.querySelector('#distTable tbody').appendChild(tr);
-
-    tr.querySelectorAll('input').forEach(inp=>{
-      inp.addEventListener('input', debounce(saveList, 250));
-      inp.addEventListener('blur', debounce(saveList, 250));
-    });
-
-    if (!opts.skipSave) saveList();
-  }
-
-  // ========= Import CSV / XLSX =========
-  function injectFileIntoPresseroUpload(f) {
-    const inp = document.getElementById(FILE_UPLOAD_ID);
-    if (!inp) return setTimeout(()=>injectFileIntoPresseroUpload(f), 200);
-
-    const dt = new DataTransfer();
-    dt.items.add(f);
-    inp.files = dt.files;
-
-    const nm = inp.closest('.file-upload-control')?.querySelector('.file-upload-name');
-    if (nm) nm.value = f.name;
-
-    console.log('✅ Fichier injecté dans', FILE_UPLOAD_ID, f.name);
-  }
-
-  function pick(row, keys){
-    for (const k of keys) {
-      if (row[k] != null && String(row[k]).trim() !== '') return row[k];
+  function readQuantitiesFromDOM(){
+    const els = [...document.querySelectorAll('input[id^="Quantities["], input[name^="Quantities["]')];
+    const arr = [];
+    for (const el of els) {
+      const n = parseInt(String(el.value || "").replace(",", "."), 10);
+      if (!Number.isNaN(n) && n > 0) arr.push(n);
     }
-    const lower = Object.fromEntries(Object.entries(row).map(([k,v])=>[k.toLowerCase(), v]));
-    for (const k of keys) {
-      const lk = k.toLowerCase();
-      if (lower[lk] != null && String(lower[lk]).trim() !== '') return lower[lk];
+    if (arr.length) return arr;
+
+    const q = [];
+    for (let i=1;i<=10;i++){
+      const el = document.getElementById(`Q${i}`);
+      if (!el) continue;
+      const n = parseInt(String(el.value || "").replace(",", "."), 10);
+      if (!Number.isNaN(n) && n > 0) q.push(n);
     }
-    return '';
+    return q;
   }
 
-  function rowsToList(rows){
-    const list = [];
-    for (const r of rows || []) {
-      const address = String(pick(r, ['address','adresse','addr','street','rue','direccion','dirección'])).trim();
-      const zip     = String(pick(r, ['zip','postal','postcode','cp','code postal','codigo postal','código postal'])).trim();
-      const city    = String(pick(r, ['city','ville','ciudad','town'])).trim();
-      const qtyRaw  = pick(r, ['qty','quantity','quantite','quantité','qte','cantidad']);
-      const qty     = parseInt(String(qtyRaw).replace(',', '.'), 10) || 0;
-
-      if ((address || zip || city) && qty > 0) list.push({ address, zip, city, qty });
-    }
-    return mergeDuplicates(list);
-  }
-
-function readQuantitiesFromDOM() {
-  // 1) tente Quantities[0], Quantities[1]...
-  const els = [
-    ...document.querySelectorAll('input[id^="Quantities["], input[name^="Quantities["]')
-  ];
-
-  const arr = [];
-  for (const el of els) {
-    const v = String(el.value || "").trim();
-    const n = parseInt(v.replace(",", "."), 10);
-    if (!Number.isNaN(n)) arr.push(n);
-  }
-  if (arr.length) return arr;
-
-  // 2) fallback Q1..Q10
-  const q = [];
-  for (let i = 1; i <= 10; i++) {
-    const el = document.getElementById(`Q${i}`);
-    if (!el) continue;
-    const n = parseInt(String(el.value || "").replace(",", "."), 10);
-    if (!Number.isNaN(n)) q.push(n);
-  }
-  return q;
-}
-
-
-  // ========= Calls Render =========
-  async function validateAddresses() {
-    const userEmail = getUserEmail();
-    if (!userEmail) return showMsg("Email utilisateur introuvable (#correo).", "err");
-
-    const list = mergeDuplicates(getListRawFromTable());
-    if (!list.length) return showMsg("Liste vide.", "err");
-
-    showMsg("Validation des adresses…", "info");
-
-    const r = await fetch(ENDPOINT_VALIDATE, {
-      method: "POST",
-      headers: { "Content-Type":"application/json" },
-      body: JSON.stringify({
-  userEmail,
-  urlName: URL_NAME,
-  shippingMethod: SHIPPING_METHOD_ID,
-  pricingOptions,
-  validatedList,
-  otherQuantities
-})
-
-    });
-
-    const data = await r.json().catch(()=>({}));
-    if (!r.ok) return showMsg(data.error || "Erreur validation adresses.", "err");
-
-    validatedList = data.validated || [];
-    if (!validatedList.length) return showMsg("Aucune adresse validée.", "err");
-
-    showMsg(`OK ✅ ${validatedList.length} adresse(s) validée(s).`, "ok");
-    document.getElementById("addToCartDistBtn").disabled = false;
-  }
-
-  async function addToCartDistribution() {
-    const userEmail = getUserEmail();
-    if (!userEmail) return showMsg("Email utilisateur introuvable (#correo).", "err");
-    if (!validatedList?.length) return showMsg("Valide d'abord les adresses.", "err");
-
-    const pricingOptions = readPricingOptionsFromDOM();
-    if (!pricingOptions.length) return showMsg("Impossible de lire les options du calculateur.", "err");
-
-    if (!SHIPPING_METHOD_ID || SHIPPING_METHOD_ID.includes("TODO")) {
-      return showMsg("ShippingMethodId manquant. Renseigne SHIPPING_METHOD_ID dans le script.", "err");
-    }
-const qs = readQuantitiesFromDOM();        // ex: [1000, 32]
-const otherQuantities = qs.slice(1);       // ex: [32]
-
-    showMsg("Ajout au panier…", "info");
-
-    const r = await fetch(ENDPOINT_ADD_CART, {
-      method: "POST",
-      headers: { "Content-Type":"application/json" },
-      body: JSON.stringify({
-        userEmail,
-        urlName: URL_NAME,
-        shippingMethod: SHIPPING_METHOD_ID,
-        pricingOptions,
-        validatedList,
-        // optionnel, si tu veux envoyer aussi:
-        siteDomain: getSiteDomain()
-      })
-    });
-
-    const data = await r.json().catch(()=>({}));
-    if (!r.ok) return showMsg(data.error || "Erreur ajout panier.", "err");
-
-    showMsg(`Panier OK ✅ ${data.added} item(s) ajoutés.`, "ok");
-  }
-
-  // ========= INIT UI =========
-  document.addEventListener('DOMContentLoaded', ()=>{
-
-    const css = document.createElement('style');
+  // ---- UI injection
+  document.addEventListener("DOMContentLoaded", () => {
+    const css = document.createElement("style");
     css.textContent = `
-      #distribution-list-container { margin:20px 0; font-family:sans-serif; }
-      #distFileInput,#addRowBtn,#validateAddressesBtn,#addToCartDistBtn { margin-right:10px; margin-bottom:10px; }
-      #distTable { width:100%; border-collapse:collapse; margin-top:10px; }
-      #distTable th,#distTable td { border:1px solid #ccc; padding:8px; vertical-align:top; }
-      #distTable th { background:#f5f5f5; text-align:left; }
-      #distTable input { width:100%; box-sizing:border-box; padding:6px; }
-      .removeRowBtn { background:#e74c3c; color:#fff; border:none; padding:6px 10px; cursor:pointer; border-radius:4px; }
-      .removeRowBtn:hover { background:#c0392b; }
-      .dist-actions { white-space:nowrap; }
-      .dist-msg { margin-top:10px; padding:10px; border-radius:6px; font-size:12px; }
-      .dist-msg.info { background:#eef4ff; border:1px solid #cfe0ff; color:#1d3b8b; }
-      .dist-msg.ok   { background:#e7f7ee; border:1px solid #bfe6cf; color:#1f6f3d; }
-      .dist-msg.err  { background:#fdecea; border:1px solid #f5c2c0; color:#a1241c; }
+      .dist-btn { padding:10px 14px; border-radius:8px; border:1px solid #ccc; cursor:pointer; background:#fff; }
+      .dist-modal-backdrop { position:fixed; inset:0; background:rgba(0,0,0,.55); display:none; z-index:99999; }
+      .dist-modal { position:fixed; top:50%; left:50%; transform:translate(-50%,-50%); width:min(980px,92vw); max-height:86vh; overflow:auto;
+        background:#fff; border-radius:12px; padding:16px; display:none; z-index:100000; box-shadow:0 20px 60px rgba(0,0,0,.25);}
+      .dist-modal h3 { margin:0 0 10px; }
+      .dist-row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin:8px 0; }
+      .dist-actions { display:flex; gap:10px; flex-wrap:wrap; margin-top:10px; }
+      .dist-msg { margin-top:10px; padding:10px; border-radius:8px; font-size:12px; display:none; }
+      .dist-msg.info { background:#eef4ff; border:1px solid #cfe0ff; }
+      .dist-msg.ok { background:#e7f7ee; border:1px solid #bfe6cf; }
+      .dist-msg.err { background:#fdecea; border:1px solid #f5c2c0; }
+      #distAddrTable { width:100%; border-collapse:collapse; margin-top:10px; }
+      #distAddrTable th, #distAddrTable td { border:1px solid #ddd; padding:8px; vertical-align:top; }
+      #distAddrTable th { background:#f5f5f5; text-align:left; position:sticky; top:0; }
+      .qty-input { width:90px; }
+      .close-x { margin-left:auto; cursor:pointer; font-size:18px; padding:4px 8px; }
+      .small { font-size:12px; opacity:.75; }
     `;
     document.head.appendChild(css);
 
-    const notes = document.querySelector('.orderNotesArea');
-    if (!notes) return console.warn('orderNotesArea introuvable');
+    const notes = document.querySelector(".orderNotesArea") || document.querySelector("#orderNotesArea");
+    if (!notes) return;
 
-    notes.insertAdjacentHTML('beforebegin', `
-      <div id="distribution-list-container">
-        <h3>Liste de distribution</h3>
+    notes.insertAdjacentHTML("beforebegin", `
+      <div style="margin:14px 0;">
+        <button class="dist-btn" id="openDistBtn" type="button">Ouvrir ma liste de distribution</button>
+        <div class="small">Saisis les quantités par adresse, importe de nouvelles adresses, puis ajoute au panier.</div>
+      </div>
 
-        <input type="file" id="distFileInput" accept=".csv,.xls,.xlsx">
-        <button id="addRowBtn" type="button">+ Ajouter une ligne</button>
-        <button id="validateAddressesBtn" type="button">✅ Valider mes adresses</button>
-        <button id="addToCartDistBtn" type="button" disabled>🛒 Mettre au panier</button>
+      <div class="dist-modal-backdrop" id="distBackdrop"></div>
+      <div class="dist-modal" id="distModal">
+        <div class="dist-row">
+          <h3>Liste de distribution</h3>
+          <div class="close-x" id="distClose">✕</div>
+        </div>
 
-        <table id="distTable">
+        <div class="dist-actions">
+          <a class="dist-btn" id="exportCsvBtn" href="#" target="_blank" rel="noopener">Télécharger mes adresses (CSV)</a>
+          <label class="dist-btn" style="display:inline-block;">
+            Importer nouvelles adresses (CSV/XLSX)
+            <input type="file" id="distImportFile" accept=".csv,.xls,.xlsx" style="display:none;">
+          </label>
+          <button class="dist-btn" id="refreshAddrBtn" type="button">Rafraîchir</button>
+          <button class="dist-btn" id="addToCartBtn" type="button">Ajouter au panier</button>
+        </div>
+
+        <div id="distMsg" class="dist-msg info"></div>
+
+        <table id="distAddrTable">
           <thead>
             <tr>
               <th>Adresse</th>
-              <th>Code postal</th>
+              <th>CP</th>
               <th>Ville</th>
-              <th style="width:140px;">Quantité</th>
-              <th class="dist-actions">Action</th>
+              <th>Contact</th>
+              <th>Quantité</th>
             </tr>
           </thead>
           <tbody></tbody>
         </table>
-
-        <div id="distMsg" class="dist-msg info" style="display:none;"></div>
       </div>
     `);
 
-    document.getElementById('addRowBtn').addEventListener('click', ()=>addRow());
+    const btnOpen = document.getElementById("openDistBtn");
+    const modal = document.getElementById("distModal");
+    const backdrop = document.getElementById("distBackdrop");
+    const msg = document.getElementById("distMsg");
+    const tbody = document.querySelector("#distAddrTable tbody");
+    const exportBtn = document.getElementById("exportCsvBtn");
 
-    document.querySelector('#distTable tbody').addEventListener('click', e=>{
-      if (e.target.classList.contains('removeRowBtn')) {
-        e.target.closest('tr').remove();
-        saveList();
+    let addrCache = []; // {addressId, address1, postal, city, contact, isPreferred}
+    let importing = false;
+
+    function setCalcField(id, value) {
+  const el = document.getElementById(id);
+  if (!el) return false;
+  el.value = String(value);
+  el.dispatchEvent(new Event("input", { bubbles: true }));
+  el.dispatchEvent(new Event("change", { bubbles: true }));
+  return true;
+}
+
+function getIntField(id) {
+  const el = document.getElementById(id);
+  if (!el) return 0;
+  const n = parseInt(String(el.value || "").replace(",", "."), 10);
+  return Number.isFinite(n) ? n : 0;
+}
+
+
+    function showMsg(text, type="info"){
+      msg.className = `dist-msg ${type}`;
+      msg.style.display = text ? "block" : "none";
+      msg.textContent = text || "";
+    }
+
+    function open(){
+      backdrop.style.display = "block";
+      modal.style.display = "block";
+    }
+    function close(){
+      backdrop.style.display = "none";
+      modal.style.display = "none";
+    }
+
+    async function loadAddresses(){
+      const userEmail = getUserEmail();
+      const siteDomain = getSiteDomain();
+      if (!userEmail) return showMsg("Tu dois être connecté pour charger l’AddressBook.", "err");
+      showMsg("Chargement des adresses…", "info");
+
+      exportBtn.href = `${END_EXPORT}?userEmail=${encodeURIComponent(userEmail)}&siteDomain=${encodeURIComponent(siteDomain)}`;
+
+      const r = await fetch(END_LIST, {
+        method:"POST",
+        headers:{ "Content-Type":"application/json" },
+        body: JSON.stringify({ userEmail, siteDomain })
+      });
+      const data = await r.json().catch(()=>({}));
+      if (!r.ok) return showMsg(data.error || "Erreur chargement AddressBook", "err");
+
+      const preferred = data.preferred ? [{...data.preferred, _preferred:true}] : [];
+      const others = (data.addresses || []).map(a => ({...a, _preferred:false}));
+
+      addrCache = [...preferred, ...others].map(a => ({
+        addressId: a.AddressId,
+        address1: a.Address1 || "",
+        postal: a.Postal || "",
+        city: a.City || "",
+        contact: `${a.Business||""} ${a.FirstName||""} ${a.LastName||""}`.trim(),
+        isPreferred: !!a._preferred,
+        qty: 0
+      }));
+
+      renderTable();
+      showMsg(`OK ✅ ${addrCache.length} adresse(s) chargée(s).`, "ok");
+    }
+
+    function renderTable(){
+      tbody.innerHTML = "";
+      for (const a of addrCache) {
+        const tr = document.createElement("tr");
+        tr.innerHTML = `
+          <td>${escapeHtml(a.address1)}${a.isPreferred ? " <span class='small'>(préférée)</span>" : ""}</td>
+          <td>${escapeHtml(a.postal)}</td>
+          <td>${escapeHtml(a.city)}</td>
+          <td>${escapeHtml(a.contact)}</td>
+          <td><input class="qty-input" type="number" min="0" value="${a.qty || 0}" data-aid="${escapeHtml(a.addressId)}"></td>
+        `;
+        tbody.appendChild(tr);
       }
-    });
 
-    document.getElementById("validateAddressesBtn").addEventListener("click", validateAddresses);
-    document.getElementById("addToCartDistBtn").addEventListener("click", addToCartDistribution);
+      tbody.querySelectorAll(".qty-input").forEach(inp=>{
+        inp.addEventListener("input", ()=>{
+          const aid = inp.getAttribute("data-aid");
+          const n = parseInt(inp.value, 10) || 0;
+          const a = addrCache.find(x => x.addressId === aid);
+          if (a) a.qty = n;
+        });
+      });
+    }
 
-    document.getElementById('distFileInput').addEventListener('change', ev=>{
-      const f = ev.target.files[0];
-      if (!f) return;
-
-      const ext = f.name.split('.').pop().toLowerCase();
-
-      const proc = (rows)=>{
-        const list = rowsToList(rows);
-        if (!list.length) return showMsg("Aucune ligne valide trouvée (adresse/cp/ville/quantité).", "err");
-
-        document.querySelector('#distTable tbody').innerHTML = '';
-        list.forEach(r => addRow(r.address, r.zip, r.city, r.qty, {skipSave:true}));
-        saveList();
-        injectFileIntoPresseroUpload(f);
-        showMsg(`Import OK ✅ ${list.length} adresse(s) chargée(s).`, "ok");
+    function rowsToNewAddresses(rows){
+      const pick = (obj, keys) => {
+        for (const k of keys) if (obj[k] != null && String(obj[k]).trim() !== "") return obj[k];
+        const lower = Object.fromEntries(Object.entries(obj).map(([k,v])=>[k.toLowerCase(), v]));
+        for (const k of keys) {
+          const lk = k.toLowerCase();
+          if (lower[lk] != null && String(lower[lk]).trim() !== "") return lower[lk];
+        }
+        return "";
       };
 
-      if (ext === 'csv') {
-        Papa.parse(f, { header:true, skipEmptyLines:true, complete: res => proc(res.data || []) });
-      } else {
-        const rd = new FileReader();
-        rd.onload = e=>{
-          const wb = XLSX.read(new Uint8Array(e.target.result), {type:'array'});
-          const data = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]] || {});
-          proc(data || []);
+      return (rows||[]).map(r => ({
+        Business: String(pick(r, ["Business","Société","Company"])).trim(),
+        FirstName: String(pick(r, ["FirstName","Prénom","Nombre"])).trim(),
+        LastName: String(pick(r, ["LastName","Nom","Apellido"])).trim(),
+        Address1: String(pick(r, ["Address1","Adresse","Direccion","Dirección"])).trim(),
+        City: String(pick(r, ["City","Ville","Ciudad"])).trim(),
+        StateProvince: String(pick(r, ["StateProvince","State","Province","Région"])).trim() || "NA",
+        Postal: String(pick(r, ["Postal","CP","CodePostal","CodigoPostal"])).trim(),
+        Country: String(pick(r, ["Country","Pays","País"])).trim() || "FR",
+        Phone: String(pick(r, ["Phone","Téléphone","Telefono"])).trim(),
+        Email: String(pick(r, ["Email","Mail"])).trim()
+      })).filter(a => a.Business && a.Address1 && a.City && a.Postal && a.Country);
+    }
+
+    async function importAddressesFromFile(file){
+      if (importing) return;
+      importing = true;
+      try {
+        const userEmail = getUserEmail();
+        const siteDomain = getSiteDomain();
+        if (!userEmail) return showMsg("Connecte-toi avant d’importer.", "err");
+
+        const ext = file.name.split(".").pop().toLowerCase();
+
+        const processRows = async (rows) => {
+          const newAddresses = rowsToNewAddresses(rows);
+          if (!newAddresses.length) return showMsg("Aucune ligne valide à importer.", "err");
+
+          showMsg(`Création de ${newAddresses.length} adresse(s)…`, "info");
+          const r = await fetch(END_IMPORT, {
+            method:"POST",
+            headers:{ "Content-Type":"application/json" },
+            body: JSON.stringify({ userEmail, siteDomain, newAddresses })
+          });
+          const data = await r.json().catch(()=>({}));
+          if (!r.ok) return showMsg(data.error || "Erreur import", "err");
+
+          showMsg(`OK ✅ ${data.createdCount} créée(s), ${data.skippedDuplicates?.length || 0} ignorée(s).`, "ok");
+          await loadAddresses();
         };
-        rd.readAsArrayBuffer(f);
-      }
-    });
 
-    // restore cache (optionnel)
-    try {
-      const cached = JSON.parse(localStorage.getItem("dist_list_cache") || "null");
-      if (Array.isArray(cached) && cached.length) {
-        document.querySelector('#distTable tbody').innerHTML = '';
-        cached.forEach(r => addRow(r.address, r.zip, r.city, r.qty, {skipSave:true}));
-        saveList();
+        if (ext === "csv") {
+          Papa.parse(file, { header:true, skipEmptyLines:true, complete: (res)=>processRows(res.data || []) });
+        } else {
+          const rd = new FileReader();
+          rd.onload = (e)=>{
+            const wb = XLSX.read(new Uint8Array(e.target.result), {type:"array"});
+            const data = XLSX.utils.sheet_to_json(wb.Sheets[wb.SheetNames[0]] || {});
+            processRows(data || []);
+          };
+          rd.readAsArrayBuffer(file);
+        }
+      } finally {
+        importing = false;
       }
-    } catch(_) {}
+    }
 
-    // première ligne
-    addRow();
+    async function addToCart(){
+  const userEmail = getUserEmail();
+  const siteDomain = getSiteDomain();
+  if (!userEmail) return showMsg("Tu dois être connecté.", "err");
+
+  const pricingOptions = readPricingOptionsFromDOM();
+  if (!pricingOptions.length) return showMsg("Impossible de lire les options du calculateur.", "err");
+
+  const lines = addrCache
+    .filter(a => (parseInt(a.qty,10) || 0) > 0)
+    .map(a => ({
+      addressId: a.addressId,
+      qty: parseInt(a.qty,10) || 0,
+      label: `${a.address1} | ${a.postal} | ${a.city}`
+    }));
+
+  if (!lines.length) return showMsg("Aucune quantité renseignée.", "err");
+
+  // ✅ total global = somme des quantités
+  const totalGlobal = lines.reduce((s, l) => s + (l.qty || 0), 0);
+
+  // ✅ pages = Q3 (identique pour toutes les lignes)
+  const pages = getIntField("Q3");
+  if (!pages) return showMsg("Nombre de pages introuvable (champ Q3).", "err");
+
+  // ✅ on met à jour Q2 sur la page (palier global)
+  setCalcField("Q2", totalGlobal);
+
+  // ✅ otherQuantities = ce qui vient après Q1 dans ton moteur
+  // ordre moteur : [Q1 adresse, Q2 total global, Q3 pages]
+  const otherQuantities = [totalGlobal, pages];
+
+  showMsg("Ajout au panier…", "info");
+
+  const r = await fetch(END_ADD, {
+    method:"POST",
+    headers:{ "Content-Type":"application/json" },
+    body: JSON.stringify({
+      userEmail,
+      siteDomain,
+      urlName: URL_NAME,
+      shippingMethod: SHIPPING_METHOD_ID,
+      pricingOptions,
+      otherQuantities,
+      lines
+    })
   });
 
+  const data = await r.json().catch(()=>({}));
+  if (!r.ok) return showMsg(data.error || "Erreur ajout panier", "err");
+
+  showMsg(`Panier OK ✅ ajouté: ${data.added || 0} (warnings: ${data.warnings || 0})`, "ok");
+}
+
+
+    // events
+    btnOpen.addEventListener("click", async ()=>{
+      open();
+      await loadAddresses();
+    });
+    document.getElementById("distClose").addEventListener("click", close);
+    backdrop.addEventListener("click", close);
+    document.getElementById("refreshAddrBtn").addEventListener("click", loadAddresses);
+    document.getElementById("addToCartBtn").addEventListener("click", addToCart);
+    document.getElementById("distImportFile").addEventListener("change", (e)=>{
+      const f = e.target.files?.[0];
+      if (f) importAddressesFromFile(f);
+      e.target.value = "";
+    });
+  });
 })();
 </script>
-

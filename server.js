@@ -134,11 +134,20 @@ app.get("/health", (req,res)=> res.json({ ok:true }));
 
 // --- Pressero helpers (selon ton doc) :contentReference[oaicite:2]{index=2}
 async function getUserId(client, siteDomain, email) {
-  const r = await client.get(`/api/site/${siteDomain}/users`, { params: { email } });
+  const r = await client.get(`/api/site/${siteDomain}/users/`, {
+    params: {
+      pageNumber: 0,
+      pageSize: 1,
+      email,
+      includeDeleted: false
+    }
+  });
+
   const userId = r?.data?.Items?.[0]?.UserId;
-  if (!userId) throw new Error("UserId introuvable pour cet email");
+  if (!userId) throw new Error("UserId introuvable pour cet email (users/ paginé)");
   return userId;
 }
+
 
 async function getCartId(client, siteDomain, userId) {
   const r = await client.get(`/api/cart/${siteDomain}/`, { params: { userId } });
@@ -155,24 +164,28 @@ async function getAddressBook(client, siteDomain, userId) {
 async function createAddress(client, siteDomain, userId, addr, template) {
   const payload = {
     Business: addr.Business || template?.Business || "Distribution",
-    FirstName: template?.FirstName || "Client",
-    LastName: template?.LastName || "Distribution",
+    FirstName: addr.FirstName || template?.FirstName || undefined,
+    LastName: addr.LastName || template?.LastName || undefined,
     Title: addr.Title || template?.Title || undefined,
     Address1: addr.Address1,
     Address2: addr.Address2 || undefined,
     Address3: addr.Address3 || undefined,
     City: addr.City,
-    StateProvince: addr.StateProvince || template?.StateProvince || "NA",
+    StateProvince: addr.StateProvince || template?.StateProvince || undefined,
     Postal: addr.Postal,
     Country: (addr.Country || template?.Country || "FR").toUpperCase(),
-    Phone: addr.Phone || template?.Phone || "",
-    Email: addr.Email || template?.Email || ""
+    Phone: addr.Phone || template?.Phone || undefined,
+    Email: addr.Email || template?.Email || undefined
   };
 
-  await client.post(`/api/site/${siteDomain}/Addressbook/${userId}/`, payload);
+  await client.post(
+    `/api/site/${siteDomain}/Addressbook/${userId}/`,
+    payload
+  );
 
-  // re-fetch & re-match
+  // Re-fetch pour retrouver l'AddressId exact
   const ab2 = await getAddressBook(client, siteDomain, userId);
+
   const key = `${norm(payload.Address1)}|${norm(payload.Postal)}|${norm(payload.City)}|${norm(payload.Business)}`;
 
   const all = [
@@ -188,13 +201,13 @@ async function createAddress(client, siteDomain, userId, addr, template) {
   return found?.AddressId || null;
 }
 
-
-
 // 1) Validate addresses: existe ? sinon créer -> retourner addressId
 app.post("/validate-addresses", async (req, res) => {
   try {
-    const { userEmail, distributionList } = req.body || {};
+    const { userEmail, siteDomain, distributionList } = req.body || {};
     if (!userEmail) return res.status(400).json({ error: "userEmail requis" });
+
+    const sd = assertSiteDomain(siteDomain);
 
     const list = mergeDuplicates(distributionList);
     if (!list.length) return res.status(400).json({ error: "distributionList vide" });
@@ -203,7 +216,7 @@ app.post("/validate-addresses", async (req, res) => {
     const client = api(token);
 
     const userId = await getUserId(client, sd, userEmail);
-    const ab = await getAddressBook(client, userId);
+    const ab = await getAddressBook(client, sd, userId);
 
     const preferred = ab?.PreferredAddress;
     const addresses = ab?.Addresses || [];
