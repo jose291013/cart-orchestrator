@@ -6,13 +6,19 @@ import cors from "cors";
 const app = express();
 app.use(express.json({ limit: "5mb" }));
 app.use(cors({
-  origin: [
-    "https://decoration.ams.v6.pressero.com"
-  ],
+  origin: (origin, cb) => {
+    if (!origin) return cb(null, true);
+    try {
+      const u = new URL(origin);
+      if (u.hostname.endsWith(".pressero.com")) return cb(null, true);
+    } catch {}
+    return cb(new Error("Not allowed by CORS"));
+  },
   methods: ["GET","POST","OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
   credentials: false
 }));
+
 
 // Optionnel : répondre explicitement au preflight
 app.options("*", cors());
@@ -58,37 +64,41 @@ function api(token) {
     }
   });
 }
+function assertSiteDomain(siteDomain) {
+  if (!siteDomain || typeof siteDomain !== "string") throw new Error("siteDomain requis");
+  const s = siteDomain.trim().toLowerCase();
+  if (!s.endsWith(".pressero.com")) throw new Error("siteDomain invalide");
+  if (/[\/\s]/.test(s)) throw new Error("siteDomain invalide");
+  return s;
+}
+
+function csvEscape(v) {
+  const s = (v ?? "").toString();
+  if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+  return s;
+}
+
+function toCsv(rows, headers) {
+  const head = headers.join(",");
+  const lines = rows.map(r => headers.map(h => csvEscape(r[h])).join(","));
+  return [head, ...lines].join("\n");
+}
+
 
 // ✅ Resolve ProductId from UrlName (brochure-dist, etc.)
-async function resolveProductId(client, urlName) {
+async function resolveProductId(client, siteDomain, urlName) {
   const r = await client.post(
-    `/api/site/${SITE_DOMAIN}/products`,
-    [
-      {
-        Column: "UrlName",
-        Value: urlName,
-        Operator: "isequalto"
-      }
-    ],
-    {
-      params: {
-        pageNumber: 0,
-        pageSize: 1,
-        includeDeleted: false
-      }
-    }
+    `/api/site/${siteDomain}/products`,
+    [{ Column: "UrlName", Value: urlName, Operator: "isequalto" }],
+    { params: { pageNumber: 0, pageSize: 1, includeDeleted: false } }
   );
 
   const item = r?.data?.Items?.[0];
   const productId = item?.ProductId;
-
-  if (!productId) {
-    throw new Error("ProductId introuvable pour UrlName=" + urlName);
-  }
-
-  console.log("✅ ProductId résolu :", productId);
+  if (!productId) throw new Error("ProductId introuvable pour UrlName=" + urlName);
   return productId;
 }
+
 
 
 // --- utils ---
@@ -123,50 +133,62 @@ function mergeDuplicates(list) {
 app.get("/health", (req,res)=> res.json({ ok:true }));
 
 // --- Pressero helpers (selon ton doc) :contentReference[oaicite:2]{index=2}
-async function getUserId(client, email) {
-  const r = await client.get(`/api/site/${SITE_DOMAIN}/users`, { params: { email }});
+async function getUserId(client, siteDomain, email) {
+  const r = await client.get(`/api/site/${siteDomain}/users`, { params: { email } });
   const userId = r?.data?.Items?.[0]?.UserId;
   if (!userId) throw new Error("UserId introuvable pour cet email");
   return userId;
 }
 
-async function getCartId(client, userId) {
-  const r = await client.get(`/api/cart/${SITE_DOMAIN}/`, { params: { userId }});
+async function getCartId(client, siteDomain, userId) {
+  const r = await client.get(`/api/cart/${siteDomain}/`, { params: { userId } });
   const cartId = r?.data?.Id;
   if (!cartId) throw new Error("CartId introuvable");
   return cartId;
 }
 
-async function getAddressBook(client, userId) {
-  const r = await client.get(`/api/site/${SITE_DOMAIN}/Addressbook/${userId}`);
+async function getAddressBook(client, siteDomain, userId) {
+  const r = await client.get(`/api/site/${siteDomain}/Addressbook/${userId}`);
   return r.data;
 }
 
-async function createAddress(client, userId, row, template) {
+async function createAddress(client, siteDomain, userId, addr, template) {
   const payload = {
+    Business: addr.Business || template?.Business || "Distribution",
     FirstName: template?.FirstName || "Client",
     LastName: template?.LastName || "Distribution",
-    Address1: row.address,
-    City: row.city,
-    Postal: row.zip,
-    Country: template?.Country || "FR",
-    Phone: template?.Phone || "",
-    Email: template?.Email || ""
+    Title: addr.Title || template?.Title || undefined,
+    Address1: addr.Address1,
+    Address2: addr.Address2 || undefined,
+    Address3: addr.Address3 || undefined,
+    City: addr.City,
+    StateProvince: addr.StateProvince || template?.StateProvince || "NA",
+    Postal: addr.Postal,
+    Country: (addr.Country || template?.Country || "FR").toUpperCase(),
+    Phone: addr.Phone || template?.Phone || "",
+    Email: addr.Email || template?.Email || ""
   };
 
-  await client.post(`/api/site/${SITE_DOMAIN}/Addressbook/${userId}`, payload);
+  await client.post(`/api/site/${siteDomain}/Addressbook/${userId}/`, payload);
 
-  // On rematch après création (robuste)
-  const ab2 = await getAddressBook(client, userId);
-  const key = addrKey(row);
-  const found = (ab2?.Addresses || []).find(a => addrKey({
-    address: a?.Address1,
-    zip: a?.Postal,
-    city: a?.City
-  }) === key);
+  // re-fetch & re-match
+  const ab2 = await getAddressBook(client, siteDomain, userId);
+  const key = `${norm(payload.Address1)}|${norm(payload.Postal)}|${norm(payload.City)}|${norm(payload.Business)}`;
+
+  const all = [
+    ab2?.PreferredAddress,
+    ...(ab2?.Addresses || [])
+  ].filter(Boolean);
+
+  const found = all.find(a => {
+    const k = `${norm(a?.Address1)}|${norm(a?.Postal)}|${norm(a?.City)}|${norm(a?.Business)}`;
+    return k === key;
+  });
 
   return found?.AddressId || null;
 }
+
+
 
 // 1) Validate addresses: existe ? sinon créer -> retourner addressId
 app.post("/validate-addresses", async (req, res) => {
@@ -212,112 +234,221 @@ app.post("/validate-addresses", async (req, res) => {
     res.status(500).json({ error: e.message || "Erreur" });
   }
 });
+app.post("/addressbook/list", async (req, res) => {
+  try {
+    const { userEmail, siteDomain } = req.body || {};
+    if (!userEmail) return res.status(400).json({ error: "userEmail requis" });
+
+    const sd = assertSiteDomain(siteDomain);
+
+    const token = await authenticate();
+    const client = api(token);
+
+    const userId = await getUserId(client, userEmail, sd); // si ton getUserId n'a pas sd, laisse tel quel
+    const r = await client.get(`/api/site/${sd}/Addressbook/${userId}`);
+
+    const preferred = r?.data?.PreferredAddress || null;
+    const addresses = r?.data?.Addresses || [];
+
+    res.json({ ok: true, preferred, addresses });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message || "Erreur" });
+  }
+});
+app.post("/addressbook/import", async (req, res) => {
+  try {
+    const { userEmail, siteDomain, newAddresses } = req.body || {};
+    if (!userEmail) return res.status(400).json({ error: "userEmail requis" });
+    if (!Array.isArray(newAddresses) || !newAddresses.length) {
+      return res.status(400).json({ error: "newAddresses requis" });
+    }
+
+    const sd = assertSiteDomain(siteDomain);
+    const token = await authenticate();
+    const client = api(token);
+
+    const userId = await getUserId(client, userEmail, sd);
+
+    // Load existing addressbook to dedupe
+    const ab = await client.get(`/api/site/${sd}/Addressbook/${userId}`);
+    const existing = [
+      ab?.data?.PreferredAddress,
+      ...(ab?.data?.Addresses || [])
+    ].filter(Boolean);
+
+    const keyOf = (a) =>
+      `${(a.Address1||"").trim().toLowerCase()}|${(a.Postal||"").trim().toLowerCase()}|${(a.City||"").trim().toLowerCase()}|${(a.Business||"").trim().toLowerCase()}`;
+
+    const existingKeys = new Set(existing.map(keyOf));
+
+    const created = [];
+    const skippedDuplicates = [];
+
+    for (const a of newAddresses) {
+      const addr = {
+        Business: (a.Business || "").trim(),
+        FirstName: (a.FirstName || "").trim() || undefined,
+        LastName: (a.LastName || "").trim() || undefined,
+        Title: (a.Title || "").trim() || undefined,
+        Address1: (a.Address1 || "").trim(),
+        Address2: (a.Address2 || "").trim() || undefined,
+        Address3: (a.Address3 || "").trim() || undefined,
+        City: (a.City || "").trim(),
+        StateProvince: (a.StateProvince || "").trim() || "NA",
+        Postal: (a.Postal || "").trim(),
+        Country: (a.Country || "FR").trim().toUpperCase(),
+        Phone: (a.Phone || "").trim() || undefined,
+        Email: (a.Email || "").trim() || undefined
+      };
+
+      if (!addr.Address1 || !addr.City || !addr.Postal || !addr.Country || !addr.Business) {
+        skippedDuplicates.push({ reason: "missing_required_fields", addr });
+        continue;
+      }
+
+      const k = keyOf(addr);
+      if (existingKeys.has(k)) {
+        skippedDuplicates.push({ reason: "duplicate", addr });
+        continue;
+      }
+
+      const r = await client.post(`/api/site/${sd}/Addressbook/${userId}/`, addr);
+      created.push({ addr, result: r?.data });
+      existingKeys.add(k);
+    }
+
+    res.json({ ok: true, createdCount: created.length, created, skippedDuplicates });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message || "Erreur" });
+  }
+});
+app.get("/addressbook/export.csv", async (req, res) => {
+  try {
+    const { userEmail, siteDomain } = req.query || {};
+    if (!userEmail) return res.status(400).send("userEmail requis");
+    const sd = assertSiteDomain(siteDomain);
+
+    const token = await authenticate();
+    const client = api(token);
+
+    const userId = await getUserId(client, userEmail, sd);
+
+    const r = await client.get(`/api/site/${sd}/Addressbook/${userId}`);
+    const preferred = r?.data?.PreferredAddress ? [{ ...r.data.PreferredAddress, IsPreferred: true }] : [];
+    const addresses = (r?.data?.Addresses || []).map(a => ({ ...a, IsPreferred: false }));
+
+    const rows = [...preferred, ...addresses].map(a => ({
+      AddressId: a.AddressId || "",
+      Business: a.Business || "",
+      FirstName: a.FirstName || "",
+      LastName: a.LastName || "",
+      Title: a.Title || "",
+      Address1: a.Address1 || "",
+      Address2: a.Address2 || "",
+      Address3: a.Address3 || "",
+      City: a.City || "",
+      StateProvince: a.StateProvince || "",
+      Postal: a.Postal || "",
+      Country: a.Country || "",
+      Phone: a.Phone || "",
+      Email: a.Email || "",
+      IsPreferred: a.IsPreferred ? "true" : "false",
+      Qty: "" // colonne vide pour que l'utilisateur puisse remplir
+    }));
+
+    const headers = ["AddressId","Business","FirstName","LastName","Title","Address1","Address2","Address3","City","StateProvince","Postal","Country","Phone","Email","IsPreferred","Qty"];
+    const csv = toCsv(rows, headers);
+
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader("Content-Disposition", 'attachment; filename="addressbook.csv"');
+    res.send(csv);
+  } catch (e) {
+    console.error(e);
+    res.status(500).send(e.message || "Erreur");
+  }
+});
+
 
 // 2) Add to cart: 1 adresse = 1 item
 app.post("/add-to-cart-distribution", async (req, res) => {
   try {
     const {
       userEmail,
-      urlName,              // ✅ au lieu de productId
+      siteDomain,
+      urlName,
       shippingMethod,
       pricingOptions,
-      validatedList
+      otherQuantities,
+      lines
     } = req.body || {};
 
-    if (!userEmail || !urlName || !shippingMethod)
-      return res.status(400).json({ error: "userEmail, urlName, shippingMethod requis" });
+    if (!userEmail || !siteDomain || !urlName || !shippingMethod)
+      return res.status(400).json({ error: "userEmail, siteDomain, urlName, shippingMethod requis" });
 
     if (!Array.isArray(pricingOptions) || !pricingOptions.length)
       return res.status(400).json({ error: "pricingOptions manquant" });
 
-    if (!Array.isArray(validatedList) || !validatedList.length)
-      return res.status(400).json({ error: "validatedList manquant" });
+    if (!Array.isArray(lines) || !lines.length)
+      return res.status(400).json({ error: "lines manquant" });
 
-    const { otherQuantities } = req.body || {};
+    const sd = assertSiteDomain(siteDomain);
     const oq = Array.isArray(otherQuantities) ? otherQuantities : [];
 
-
-    // ✅ Auth
     const token = await authenticate();
     const client = api(token);
 
-    // ✅ UserId + CartId
-    const userId = await getUserId(client, userEmail);
-    const cartId = await getCartId(client, userId);
-
-    // ✅ Resolve productId automatiquement
-    const productId = await resolveProductId(client, urlName);
+    const userId = await getUserId(client, sd, userEmail);
+    const cartId = await getCartId(client, sd, userId);
+    const productId = await resolveProductId(client, sd, urlName);
 
     const results = [];
 
-    // ✅ Boucle : 1 adresse = 1 ligne panier
-    for (const row of validatedList) {
+    for (const row of lines) {
       const qty = parseInt(row.qty, 10) || 0;
       if (!qty) continue;
-      const quantities = [qty, ...oq]; // qty = exemplaires par adresse, puis pages etc.
+
+      const quantities = [qty, ...oq];
 
       const payload = {
         ProductId: productId,
         ShipTo: row.addressId,
         ShippingMethod: shippingMethod,
-        PricingParameters: {
-        Quantities: quantities,
-        Options: pricingOptions
-    },
+        PricingParameters: { Quantities: quantities, Options: pricingOptions },
         ItemName: "Distribution",
-        Notes: `${row.address} | ${row.zip} | ${row.city}`
+        Notes: row.label || ""
       };
-      
-
 
       try {
-  const r = await client.post(
-    `/api/cart/${SITE_DOMAIN}/${cartId}/item/`,
-    payload,
-    { params: { userId } }
-  );
+        const r = await client.post(
+          `/api/cart/${sd}/${cartId}/item/`,
+          payload,
+          { params: { userId } }
+        );
+        results.push({ addressId: row.addressId, qty, status: r.status, ok: true });
+      } catch (err) {
+        const status = err?.response?.status;
+        const msg = err?.response?.data?.Message || err?.response?.data?.message || err?.message;
 
-  results.push({ addressId: row.addressId, qty, status: r.status, ok: true });
-
-} catch (err) {
-  const status = err?.response?.status;
-  const msg = err?.response?.data?.Message || err?.response?.data?.message || err?.message;
-
-  // ✅ Pressero renvoie parfois un 400 "warning" de prix
-  if (status === 400 && msg === "ReOrderFullSuccess_PriceWarning") {
-    results.push({
-      addressId: row.addressId,
-      qty,
-      status,
-      ok: true,
-      warning: msg
-    });
-    continue;
-  }
-
-  // ❌ vraie erreur
-  throw err;
-}
-
+        if (status === 400 && msg === "ReOrderFullSuccess_PriceWarning") {
+          results.push({ addressId: row.addressId, qty, status, ok: true, warning: msg });
+          continue;
+        }
+        throw err;
+      }
     }
 
     const added = results.filter(r => r.ok).length;
-const warnings = results.filter(r => r.warning).length;
+    const warnings = results.filter(r => r.warning).length;
 
-res.json({
-  ok: true,
-  cartId,
-  added,
-  warnings,
-  results
-});
-
-
+    res.json({ ok: true, cartId, added, warnings, results });
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: e.message });
   }
 });
+
 
 
 const port = process.env.PORT || 3000;
