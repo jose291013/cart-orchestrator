@@ -2,7 +2,8 @@ import express from "express";
 import axios from "axios";
 import cors from "cors";
 import ExcelJS from "exceljs";
-
+import multer from "multer";
+import Papa from "papaparse";
 
 
 const app = express();
@@ -20,6 +21,11 @@ app.use(cors({
   allowedHeaders: ["Content-Type", "Authorization"],
   credentials: false
 }));
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 15 * 1024 * 1024 } // 15MB
+});
+
 
 
 // Optionnel : répondre explicitement au preflight
@@ -130,6 +136,77 @@ function mergeDuplicates(list) {
   return [...map.values()];
 }
 
+function pick(obj, keys) {
+  if (!obj) return "";
+  const lower = Object.fromEntries(Object.entries(obj).map(([k,v]) => [String(k).toLowerCase().trim(), v]));
+  for (const k of keys) {
+    const v = lower[String(k).toLowerCase().trim()];
+    if (v !== undefined && v !== null && String(v).trim() !== "") return v;
+  }
+  return "";
+}
+
+function normalizeImportedAddress(r) {
+  // r = objet venant du CSV/Excel
+  const AddressId = String(pick(r, ["addressid","AddressId","id","Id"]) || "").trim() || undefined;
+
+  const addr = {
+    AddressId,
+    Business: String(pick(r, ["business","société","societe","company"]) || "").trim(),
+    FirstName: String(pick(r, ["firstname","prénom","prenom","nombre"]) || "").trim(),
+    LastName: String(pick(r, ["lastname","nom","apellido"]) || "").trim(),
+    Title: String(pick(r, ["title","titre","cargo"]) || "").trim(),
+    Address1: String(pick(r, ["address1","adresse","direccion","dirección"]) || "").trim(),
+    Address2: String(pick(r, ["address2"]) || "").trim(),
+    Address3: String(pick(r, ["address3"]) || "").trim(),
+    City: String(pick(r, ["city","ville","ciudad"]) || "").trim(),
+    StateProvince: String(pick(r, ["stateprovince","state","province","région","region"]) || "").trim() || "NA",
+    Postal: String(pick(r, ["postal","cp","codepostal","codigopostal"]) || "").trim(),
+    Country: String(pick(r, ["country","pays","país","pais"]) || "").trim() || "FR",
+    Phone: String(pick(r, ["phone","téléphone","telephone","telefono"]) || "").trim(),
+    Email: String(pick(r, ["email","mail"]) || "").trim()
+  };
+
+  // champs minimaux
+  if (!addr.Address1 || !addr.City || !addr.Postal || !addr.Country) return null;
+
+  // si Business vide, on met une valeur par défaut
+  if (!addr.Business) addr.Business = "Distribution";
+
+  return addr;
+}
+
+async function parseCsvBuffer(buf) {
+  const text = buf.toString("utf8");
+  const parsed = Papa.parse(text, { header: true, skipEmptyLines: true });
+  return (parsed.data || []).map(normalizeImportedAddress).filter(Boolean);
+}
+
+async function parseXlsxBuffer(buf) {
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.load(buf);
+  const ws = wb.worksheets[0];
+  if (!ws) return [];
+
+  const headerRow = ws.getRow(1);
+  const headers = headerRow.values
+    .slice(1)
+    .map(h => String(h || "").trim());
+
+  const rows = [];
+  ws.eachRow((row, rowNumber) => {
+    if (rowNumber === 1) return;
+    const obj = {};
+    headers.forEach((h, idx) => {
+      obj[h] = row.getCell(idx + 1).value;
+    });
+    const n = normalizeImportedAddress(obj);
+    if (n) rows.push(n);
+  });
+
+  return rows;
+}
+
 
 // --- basic ---
 app.get("/health", (req,res)=> res.json({ ok:true }));
@@ -184,7 +261,7 @@ async function createAddress(client, siteDomain, userId, addr, template) {
     `/api/site/${siteDomain}/Addressbook/${userId}/`,
     payload
   );
-
+  
   // Re-fetch pour retrouver l'AddressId exact
   const ab2 = await getAddressBook(client, siteDomain, userId);
 
@@ -219,37 +296,83 @@ async function upsertAddress(client, siteDomain, userId, addr) {
     Email: addr.Email || ""
   };
 
-  // ✅ Si AddressId présent → tentative d’update
+  // ✅ update si AddressId
   if (addr.AddressId) {
-    try {
-      // Route la plus logique (à tester). Si Pressero utilise PATCH/PUT ailleurs, on fallback.
-      await client.put(`/api/site/${siteDomain}/Addressbook/${userId}/${addr.AddressId}`, payload);
-      return addr.AddressId;
-    } catch (e) {
-      const st = e?.response?.status;
-      // 404/405 = endpoint update pas supporté ou pas trouvé → on tente création
-      if (st !== 404 && st !== 405) throw e;
-    }
+    await client.put(
+      `/api/site/${siteDomain}/Addressbook/${userId}/`,
+      payload,
+      { params: { addressId: addr.AddressId } }
+    );
+    return { mode: "updated", addressId: addr.AddressId };
   }
 
-  // ✅ Sinon (ou fallback) → création
-  const r = await client.post(`/api/site/${siteDomain}/Addressbook/${userId}/`, payload);
+  // ✅ create sinon
+  await client.post(`/api/site/${siteDomain}/Addressbook/${userId}/`, payload);
 
-  // si l’API renvoie un AddressId direct on le prend, sinon on rematch
-  const directId = r?.data?.AddressId || r?.data?.Id || null;
-  if (directId) return directId;
-
-  const ab2 = await getAddressBook(client, siteDomain, userId);
-  const key = `${norm(payload.Address1)}|${norm(payload.Postal)}|${norm(payload.City)}|${norm(payload.Business)}`;
-  const all = [ab2?.PreferredAddress, ...(ab2?.Addresses || [])].filter(Boolean);
-
-  const found = all.find(a => {
-    const k = `${norm(a?.Address1)}|${norm(a?.Postal)}|${norm(a?.City)}|${norm(a?.Business)}`;
-    return k === key;
-  });
-
-  return found?.AddressId || null;
+  return { mode: "created", addressId: null };
 }
+
+app.post("/addressbook/import-file", upload.single("file"), async (req, res) => {
+  try {
+    const userEmail = (req.body?.userEmail || "").trim();
+    const siteDomain = (req.body?.siteDomain || "").trim();
+    if (!userEmail) return res.status(400).json({ error: "userEmail requis" });
+
+    const sd = assertSiteDomain(siteDomain);
+
+    const f = req.file;
+    if (!f) return res.status(400).json({ error: "Fichier manquant (field 'file')" });
+
+    const name = (f.originalname || "file").toLowerCase();
+    const ext = name.split(".").pop();
+
+    let addresses = [];
+    if (ext === "csv") addresses = await parseCsvBuffer(f.buffer);
+    else if (ext === "xlsx" || ext === "xls") addresses = await parseXlsxBuffer(f.buffer);
+    else return res.status(400).json({ error: "Format non supporté (csv/xlsx)" });
+
+    if (!addresses.length) return res.status(400).json({ error: "Aucune ligne valide trouvée dans le fichier." });
+
+    // Auth + userId + addressbook
+    const token = await authenticate();
+    const client = api(token);
+
+    const userId = await getUserId(client, sd, userEmail);
+
+    // dédoublonner l'import par AddressId si présent, sinon par signature adresse
+    const seen = new Set();
+    const unique = [];
+    for (const a of addresses) {
+      const key = a.AddressId
+        ? `id:${a.AddressId}`
+        : `k:${norm(a.Address1)}|${norm(a.Postal)}|${norm(a.City)}|${norm(a.Business)}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      unique.push(a);
+    }
+
+    let createdCount = 0;
+    let updatedCount = 0;
+
+    for (const addr of unique) {
+      const r = await upsertAddress(client, sd, userId, addr);
+      if (r.mode === "updated") updatedCount++;
+      else createdCount++;
+    }
+
+    res.json({
+      ok: true,
+      totalParsed: addresses.length,
+      totalImported: unique.length,
+      createdCount,
+      updatedCount
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: e.message || "Erreur import-file" });
+  }
+});
+
 
 
 // 1) Validate addresses: existe ? sinon créer -> retourner addressId
@@ -284,7 +407,14 @@ app.post("/validate-addresses", async (req, res) => {
       let addressId = existingMap.get(key) || null;
 
       if (!addressId) {
-        addressId = await createAddress(client, userId, row, preferred);
+        addressId = await createAddress(client, sd, userId, {
+  Business: row.business || "Distribution",
+  Address1: row.address,
+  City: row.city,
+  Postal: row.zip,
+  Country: row.country || preferred?.Country || "FR"
+}, preferred);
+
       }
       if (!addressId) throw new Error(`Impossible de créer/trouver l'adresse: ${row.address} ${row.zip} ${row.city}`);
 
