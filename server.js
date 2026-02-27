@@ -280,23 +280,27 @@ async function createAddress(client, siteDomain, userId, addr, template) {
   return found?.AddressId || null;
 }
 async function upsertAddress(client, siteDomain, userId, addr) {
+  // 1) on récupère une adresse "template" = preferred (utile pour pays, etc.)
+  const ab = await getAddressBook(client, siteDomain, userId);
+  const preferred = ab?.PreferredAddress || null;
+
   const payload = {
-    Business: addr.Business || "Distribution",
-    FirstName: addr.FirstName || "Client",
-    LastName: addr.LastName || "Distribution",
-    Title: addr.Title || undefined,
+    Business: addr.Business || preferred?.Business || "Distribution",
+    FirstName: addr.FirstName || preferred?.FirstName || "Client",
+    LastName: addr.LastName || preferred?.LastName || "Distribution",
+    Title: addr.Title || preferred?.Title || undefined,
     Address1: addr.Address1,
     Address2: addr.Address2 || undefined,
     Address3: addr.Address3 || undefined,
     City: addr.City,
-    StateProvince: addr.StateProvince || "NA",
+    StateProvince: addr.StateProvince || preferred?.StateProvince || "NA",
     Postal: addr.Postal,
-    Country: (addr.Country || "FR").toUpperCase(),
-    Phone: addr.Phone || "",
-    Email: addr.Email || ""
+    Country: (addr.Country || preferred?.Country || "FR").toUpperCase(),
+    Phone: addr.Phone || preferred?.Phone || undefined,
+    Email: addr.Email || preferred?.Email || undefined
   };
 
-  // ✅ update si AddressId
+  // UPDATE si AddressId
   if (addr.AddressId) {
     await client.put(
       `/api/site/${siteDomain}/Addressbook/${userId}/`,
@@ -306,10 +310,9 @@ async function upsertAddress(client, siteDomain, userId, addr) {
     return { mode: "updated", addressId: addr.AddressId };
   }
 
-  // ✅ create sinon
-  await client.post(`/api/site/${siteDomain}/Addressbook/${userId}/`, payload);
-
-  return { mode: "created", addressId: null };
+  // CREATE sinon (et on récupère l'AddressId créé)
+  const createdId = await createAddress(client, siteDomain, userId, payload, preferred);
+  return { mode: "created", addressId: createdId };
 }
 
 app.post("/addressbook/import-file", upload.single("file"), async (req, res) => {
@@ -352,13 +355,35 @@ app.post("/addressbook/import-file", upload.single("file"), async (req, res) => 
     }
 
     let createdCount = 0;
-    let updatedCount = 0;
+let updatedCount = 0;
+const errors = [];
 
-    for (const addr of unique) {
-      const r = await upsertAddress(client, sd, userId, addr);
-      if (r.mode === "updated") updatedCount++;
-      else createdCount++;
-    }
+for (let i = 0; i < unique.length; i++) {
+  const addr = unique[i];
+  try {
+    const r = await upsertAddress(client, sd, userId, addr);
+    if (r.mode === "updated") updatedCount++;
+    else createdCount++;
+  } catch (e) {
+    errors.push({
+      index: i + 1,
+      address: `${addr.Address1} / ${addr.Postal} / ${addr.City}`,
+      message: e?.response?.data?.Message || e?.message || "unknown_error",
+      status: e?.response?.status || null
+    });
+  }
+}
+
+// 200 même s’il y a des erreurs, avec rapport
+res.json({
+  ok: errors.length === 0,
+  totalParsed: addresses.length,
+  totalImported: unique.length,
+  createdCount,
+  updatedCount,
+  errorCount: errors.length,
+  errors
+});
 
     res.json({
       ok: true,
