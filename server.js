@@ -2,33 +2,23 @@
 import express from "express";
 import axios from "axios";
 import cors from "cors";
+import ExcelJS from "exceljs";
 import multer from "multer";
+import Papa from "papaparse";
 
-
-// -------------------- CONFIG --------------------
-const PORT = process.env.PORT || 10000;
-
-// Base admin Pressero
-const ADMIN_BASE = process.env.PRESSERO_ADMIN_BASE || "https://admin.ams.v6.pressero.com";
-console.log("[CFG] ADMIN_BASE =", ADMIN_BASE);
-
-// Identifiants (mets-les dans Render > Environment)
-const ADMIN_USER = process.env.PRESSERO_ADMIN_USER || process.env.ADMIN_USER || "";
-const ADMIN_PASS = process.env.PRESSERO_ADMIN_PASS || process.env.ADMIN_PASS || "";
-
-// -------------------- APP --------------------
 const app = express();
 app.set("trust proxy", true);
 app.use(express.json({ limit: "10mb" }));
 
-// -------------------- CORS (UN SEUL SYSTEME) --------------------
+/**
+ * -------------------- CORS (simple et stable) --------------------
+ * Autorise les pages Pressero (*.pressero.com). Pas de double système.
+ */
 app.use(cors({
   origin: (origin, cb) => {
-    // Server-to-server / Postman (no origin)
-    if (!origin) return cb(null, true);
+    if (!origin) return cb(null, true); // server-to-server / Postman
     try {
       const u = new URL(origin);
-      // Autorise tous les sous-domaines Pressero
       if (u.hostname.endsWith(".pressero.com")) return cb(null, true);
     } catch {}
     return cb(new Error("Not allowed by CORS"));
@@ -39,68 +29,64 @@ app.use(cors({
 }));
 app.options("*", cors());
 
-// -------------------- MULTER --------------------
-const upload = multer({ storage: multer.memoryStorage() });
+/**
+ * -------------------- Upload --------------------
+ */
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 15 * 1024 * 1024 } // 15MB
+});
 
-// -------------------- UTILS --------------------
-function norm(s) {
-  return (s ?? "").toString().trim().toLowerCase().replace(/\s+/g, " ");
-}
+/**
+ * -------------------- ENV (on garde tes variables d'avant) --------------------
+ * (NE change pas tes env Render si tu utilisais déjà celles-ci)
+ */
+const ADMIN_URL = process.env.PRESSERO_ADMIN_URL || "https://admin.ams.v6.pressero.com";
 
-// Signature SANS Business (pour éviter les doublons)
-function sigNoBusiness(a) {
-  return `${norm(a.Address1)}|${norm(a.Postal)}|${norm(a.City)}|${norm(a.Country || "")}`;
+const AUTH_PAYLOAD = {
+  UserName: process.env.PRESSERO_USERNAME,
+  Password: process.env.PRESSERO_PASSWORD,
+  SubscriberId: process.env.PRESSERO_SUBSCRIBER_ID,
+  ConsumerID: process.env.PRESSERO_CONSUMER_ID
+};
+
+function assertEnv() {
+  const missing = Object.entries(AUTH_PAYLOAD)
+    .filter(([, v]) => !v)
+    .map(([k]) => k);
+
+  if (missing.length) {
+    throw new Error(`Missing ENV: ${missing.join(", ")}`);
+  }
 }
 
 function assertSiteDomain(siteDomain) {
-  const sd = (siteDomain || "").trim();
-  if (!sd) throw new Error("siteDomain requis");
-  // garde-fou
-  if (!/^[a-z0-9.-]+$/i.test(sd)) throw new Error("siteDomain invalide");
-  return sd;
+  if (!siteDomain || typeof siteDomain !== "string") throw new Error("siteDomain requis");
+  const s = siteDomain.trim().toLowerCase();
+  if (!s.endsWith(".pressero.com")) throw new Error("siteDomain invalide");
+  if (/[\/\s]/.test(s)) throw new Error("siteDomain invalide");
+  return s;
 }
 
-function requireEnv() {
-  if (!ADMIN_USER || !ADMIN_PASS) {
-    throw new Error("Missing env: PRESSERO_ADMIN_USER / PRESSERO_ADMIN_PASS");
-  }
-}
-
-// -------------------- AUTH / API CLIENT --------------------
+/**
+ * -------------------- AUTH / API --------------------
+ * On garde EXACTEMENT la méthode qui marchait chez toi.
+ */
 async function authenticate() {
-  requireEnv();
+  assertEnv();
+  const r = await axios.post(`${ADMIN_URL}/api/V2/Authentication`, AUTH_PAYLOAD, {
+    headers: { "Content-Type": "application/json" },
+    timeout: 30000
+  });
 
-  const candidates = [
-    "/api/public/authenticate",
-    "/api/public/authentication/token"
-    // ⚠️ retire /api/authenticate (ça t’a déjà cassé)
-  ];
-
-  let lastErr;
-  for (const p of candidates) {
-    try {
-      console.log("[AUTH] trying:", `${ADMIN_BASE}${p}`);
-
-      const r = await axios.post(
-        `${ADMIN_BASE}${p}`,
-        { UserName: ADMIN_USER, Password: ADMIN_PASS },
-        { timeout: 20000 }
-      );
-
-      const token = r?.data?.Token || r?.data?.token || r?.data?.AuthToken || r?.data;
-      if (token && typeof token === "string") return token;
-
-      lastErr = new Error(`Auth ok but token missing for ${p}`);
-    } catch (e) {
-      lastErr = e;
-    }
-  }
-  throw lastErr || new Error("Authentication failed");
+  const token = r?.data?.Token;
+  if (!token) throw new Error("Token introuvable dans la réponse auth (champ Token)");
+  return token;
 }
 
 function api(token) {
   return axios.create({
-    baseURL: ADMIN_BASE,
+    baseURL: ADMIN_URL,
     timeout: 30000,
     headers: {
       "Accept": "application/json, text/plain, */*",
@@ -110,41 +96,114 @@ function api(token) {
   });
 }
 
-// -------------------- PRESERO HELPERS --------------------
+/**
+ * -------------------- Normalisation / signatures anti-doublons --------------------
+ */
+function norm(s) {
+  return (s ?? "")
+    .toString()
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .replace(/[’']/g, "'")
+    .trim();
+}
 
-// Fallback getUserId : tente plusieurs endpoints connus
-async function getUserId(client, siteDomain, email) {
-  const em = (email || "").trim();
-  if (!em) throw new Error("Email requis pour getUserId");
+// signature "sans Business" : c'est la clé la plus sûre pour éviter les doublons
+function sigNoBusiness(a) {
+  return `${norm(a?.Address1)}|${norm(a?.Postal)}|${norm(a?.City)}|${norm(a?.Country || "")}`;
+}
 
-  // essais d’endpoints (selon versions/tenants)
-  const tries = [
-    { method: "get", url: `/api/site/${siteDomain}/User`, params: { email: em } },
-    { method: "get", url: `/api/site/${siteDomain}/Users`, params: { email: em } },
-    { method: "get", url: `/api/site/${siteDomain}/User/Find`, params: { email: em } },
-    { method: "get", url: `/api/site/${siteDomain}/Users/Find`, params: { email: em } },
-    { method: "get", url: `/api/site/${siteDomain}/UserByEmail`, params: { email: em } }
-  ];
-
-  let lastErr;
-  for (const t of tries) {
-    try {
-      const r = await client[t.method](t.url, { params: t.params });
-      const data = r?.data;
-
-      // formats possibles
-      const id =
-        data?.UserId || data?.Id || data?.id ||
-        (Array.isArray(data) ? (data[0]?.UserId || data[0]?.Id || data[0]?.id) : null) ||
-        (data?.User ? (data.User.UserId || data.User.Id) : null);
-
-      if (id) return id;
-      lastErr = new Error(`UserId introuvable via ${t.url}`);
-    } catch (e) {
-      lastErr = e;
-    }
+function pick(obj, keys) {
+  if (!obj) return "";
+  const lower = Object.fromEntries(
+    Object.entries(obj).map(([k, v]) => [String(k).toLowerCase().trim(), v])
+  );
+  for (const k of keys) {
+    const v = lower[String(k).toLowerCase().trim()];
+    if (v !== undefined && v !== null && String(v).trim() !== "") return v;
   }
-  throw lastErr || new Error("Impossible de récupérer userId");
+  return "";
+}
+
+function normalizeImportedAddress(r) {
+  const AddressId = String(pick(r, ["addressid", "AddressId", "id", "Id"]) || "").trim() || undefined;
+
+  const addr = {
+    AddressId,
+    Business: String(pick(r, ["business", "société", "societe", "company"]) || "").trim(),
+    FirstName: String(pick(r, ["firstname", "prénom", "prenom", "nombre"]) || "").trim(),
+    LastName: String(pick(r, ["lastname", "nom", "apellido"]) || "").trim(),
+    Title: String(pick(r, ["title", "titre", "cargo"]) || "").trim(),
+    Address1: String(pick(r, ["address1", "adresse", "direccion", "dirección", "address"]) || "").trim(),
+    Address2: String(pick(r, ["address2"]) || "").trim(),
+    Address3: String(pick(r, ["address3"]) || "").trim(),
+    City: String(pick(r, ["city", "ville", "ciudad"]) || "").trim(),
+    StateProvince: String(pick(r, ["stateprovince", "state", "province", "région", "region"]) || "").trim() || "NA",
+    Postal: String(pick(r, ["postal", "cp", "codepostal", "codigopostal", "zip"]) || "").trim(),
+    Country: String(pick(r, ["country", "pays", "país", "pais"]) || "").trim() || "FR",
+    Phone: String(pick(r, ["phone", "téléphone", "telephone", "telefono"]) || "").trim(),
+    Email: String(pick(r, ["email", "mail"]) || "").trim()
+  };
+
+  // champs minimaux
+  if (!addr.Address1 || !addr.City || !addr.Postal || !addr.Country) return null;
+
+  // par défaut
+  if (!addr.Business) addr.Business = "Distribution";
+
+  return addr;
+}
+
+/**
+ * -------------------- Parsers CSV/XLSX --------------------
+ */
+async function parseCsvBuffer(buf) {
+  const text = buf.toString("utf8");
+  const parsed = Papa.parse(text, { header: true, skipEmptyLines: true });
+  return (parsed.data || []).map(normalizeImportedAddress).filter(Boolean);
+}
+
+async function parseXlsxBuffer(buf) {
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.load(buf);
+  const ws = wb.worksheets[0];
+  if (!ws) return [];
+
+  const headerRow = ws.getRow(1);
+  const headers = headerRow.values.slice(1).map(h => String(h || "").trim());
+
+  const rows = [];
+  ws.eachRow((row, rowNumber) => {
+    if (rowNumber === 1) return;
+    const obj = {};
+    headers.forEach((h, idx) => {
+      obj[h] = row.getCell(idx + 1).value;
+    });
+    const n = normalizeImportedAddress(obj);
+    if (n) rows.push(n);
+  });
+
+  return rows;
+}
+
+/**
+ * -------------------- Pressero helpers --------------------
+ */
+async function getUserId(client, siteDomain, email) {
+  const r = await client.get(`/api/site/${siteDomain}/users/`, {
+    params: { pageNumber: 0, pageSize: 1, email, includeDeleted: false }
+  });
+  const userId = r?.data?.Items?.[0]?.UserId;
+  if (!userId) throw new Error("UserId introuvable pour cet email");
+  return userId;
+}
+
+async function getCartId(client, siteDomain, userId) {
+  const r = await client.get(`/api/cart/${siteDomain}/`, { params: { userId } });
+  const cartId = r?.data?.Id;
+  if (!cartId) throw new Error("CartId introuvable");
+  return cartId;
 }
 
 async function getAddressBook(client, siteDomain, userId) {
@@ -152,7 +211,20 @@ async function getAddressBook(client, siteDomain, userId) {
   return r.data;
 }
 
-// create + refetch pour récupérer AddressId
+// Resolve ProductId from UrlName
+async function resolveProductId(client, siteDomain, urlName) {
+  const r = await client.post(
+    `/api/site/${siteDomain}/products`,
+    [{ Column: "UrlName", Value: urlName, Operator: "isequalto" }],
+    { params: { pageNumber: 0, pageSize: 1, includeDeleted: false } }
+  );
+
+  const item = r?.data?.Items?.[0];
+  const productId = item?.ProductId;
+  if (!productId) throw new Error("ProductId introuvable pour UrlName=" + urlName);
+  return productId;
+}
+
 async function createAddress(client, siteDomain, userId, addr, template) {
   const payload = {
     Business: addr.Business || template?.Business || "Distribution",
@@ -172,7 +244,7 @@ async function createAddress(client, siteDomain, userId, addr, template) {
 
   await client.post(`/api/site/${siteDomain}/Addressbook/${userId}/`, payload);
 
-  // Refetch & match (SANS business) => plus stable
+  // Re-fetch pour retrouver l'AddressId exact
   const ab2 = await getAddressBook(client, siteDomain, userId);
   const all = [ab2?.PreferredAddress, ...(ab2?.Addresses || [])].filter(Boolean);
 
@@ -202,7 +274,6 @@ async function upsertAddress(client, siteDomain, userId, addr) {
     Email: addr.Email || preferred?.Email || undefined
   };
 
-  // UPDATE
   if (addr.AddressId) {
     await client.put(
       `/api/site/${siteDomain}/Addressbook/${userId}/`,
@@ -212,59 +283,34 @@ async function upsertAddress(client, siteDomain, userId, addr) {
     return { mode: "updated", addressId: addr.AddressId };
   }
 
-  // CREATE
   const createdId = await createAddress(client, siteDomain, userId, payload, preferred);
   return { mode: "created", addressId: createdId };
 }
 
-// -------------------- PARSERS --------------------
-function normalizeRowToAddress(row) {
-  // accepte colonnes variées : AddressId / AddressID etc.
-  const addr = {
-    AddressId: (row.AddressId || row.AddressID || row.addressId || row.addressID || "").toString().trim() || "",
-    Business: (row.Business || row.business || "").toString().trim() || "Distribution",
-    FirstName: (row.FirstName || row.firstname || "").toString().trim() || "Client",
-    LastName: (row.LastName || row.lastname || "").toString().trim() || "Distribution",
-    Title: (row.Title || row.title || "").toString().trim() || "",
-    Address1: (row.Address1 || row.address1 || row.Address || row.address || "").toString().trim(),
-    Address2: (row.Address2 || row.address2 || "").toString().trim() || "",
-    Address3: (row.Address3 || row.address3 || "").toString().trim() || "",
-    City: (row.City || row.city || "").toString().trim(),
-    StateProvince: (row.StateProvince || row.state || row.province || "NA").toString().trim() || "NA",
-    Postal: (row.Postal || row.zip || row.postal || "").toString().trim(),
-    Country: (row.Country || row.country || "FR").toString().trim().toUpperCase(),
-    Phone: (row.Phone || row.phone || "").toString().trim() || "",
-    Email: (row.Email || row.email || "").toString().trim() || ""
-  };
-
-  // nettoie AddressId vide
-  if (!addr.AddressId) delete addr.AddressId;
-  return addr;
+/**
+ * -------------------- CSV export helpers --------------------
+ */
+function csvEscape(v) {
+  const s = (v ?? "").toString();
+  if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+  return s;
 }
 
-
-async function parseCsvBuffer(buf) {
-  const txt = buf.toString("utf-8");
-  const lines = txt.split(/\r?\n/).filter(l => l.trim().length);
-  if (!lines.length) return [];
-
-  const headers = lines[0].split(",").map(h => h.trim());
-  const out = [];
-  for (let i = 1; i < lines.length; i++) {
-    const cols = lines[i].split(",").map(c => c.trim());
-    const row = {};
-    headers.forEach((h, idx) => row[h] = cols[idx] ?? "");
-    const addr = normalizeRowToAddress(row);
-    if (addr.Address1 && addr.City && addr.Postal && addr.Country) out.push(addr);
-  }
-  return out;
+function toCsv(rows, headers) {
+  const head = headers.join(",");
+  const lines = rows.map(r => headers.map(h => csvEscape(r[h])).join(","));
+  return [head, ...lines].join("\n");
 }
 
-// -------------------- ROUTES --------------------
+/**
+ * -------------------- ROUTES --------------------
+ */
 app.get("/health", (req, res) => res.json({ ok: true }));
 
-// Liste addressbook (dedupe preferred)
-app.post("/addressbook/list", async (req, res, next) => {
+/**
+ * Addressbook list
+ */
+app.post("/addressbook/list", async (req, res) => {
   try {
     const { userEmail, siteDomain } = req.body || {};
     if (!userEmail) return res.status(400).json({ error: "userEmail requis" });
@@ -280,6 +326,7 @@ app.post("/addressbook/list", async (req, res, next) => {
     const preferred = ab?.PreferredAddress || null;
     const addresses = ab?.Addresses || [];
 
+    // dédoublonnage par AddressId
     const map = new Map();
     for (const a of [preferred, ...addresses].filter(Boolean)) {
       const id = a?.AddressId;
@@ -288,23 +335,29 @@ app.post("/addressbook/list", async (req, res, next) => {
 
     return res.json({
       ok: true,
-      userId,
       preferredId: preferred?.AddressId || null,
       addresses: [...map.values()]
     });
   } catch (e) {
-    return next(e);
+    console.error(e);
+    return res.status(500).json({ error: e.message || "Erreur" });
   }
 });
 
-// Import fichier (CSV/XLSX) : update + create + SKIP doublons existants
-app.post("/addressbook/import-file", upload.single("file"), async (req, res, next) => {
+/**
+ * Import file (CSV/XLSX)
+ * Objectif: update si AddressId, sinon CREATE,
+ * MAIS: skip si (sans AddressId) l'adresse existe déjà dans l'addressbook (signature sans business)
+ * + dédoublonnage interne du fichier
+ */
+app.post("/addressbook/import-file", upload.single("file"), async (req, res) => {
   try {
     const userEmail = (req.body?.userEmail || "").trim();
     const siteDomain = (req.body?.siteDomain || "").trim();
     if (!userEmail) return res.status(400).json({ error: "userEmail requis" });
 
     const sd = assertSiteDomain(siteDomain);
+
     const f = req.file;
     if (!f) return res.status(400).json({ error: "Fichier manquant (field 'file')" });
 
@@ -313,7 +366,8 @@ app.post("/addressbook/import-file", upload.single("file"), async (req, res, nex
 
     let addresses = [];
     if (ext === "csv") addresses = await parseCsvBuffer(f.buffer);
-else return res.status(400).json({ error: "Format non supporté (csv uniquement)" });
+    else if (ext === "xlsx" || ext === "xls") addresses = await parseXlsxBuffer(f.buffer);
+    else return res.status(400).json({ error: "Format non supporté (csv/xlsx)" });
 
     if (!addresses.length) {
       return res.status(400).json({ error: "Aucune ligne valide trouvée dans le fichier." });
@@ -321,24 +375,20 @@ else return res.status(400).json({ error: "Format non supporté (csv uniquement)
 
     const token = await authenticate();
     const client = api(token);
-
     const userId = await getUserId(client, sd, userEmail);
 
-    // EXISTING signatures in addressbook (skip duplicates)
+    // signatures existantes dans l'addressbook => SKIP des créations en doublon
     const abExisting = await getAddressBook(client, sd, userId);
-    const existingAll = [
-      abExisting?.PreferredAddress,
-      ...(abExisting?.Addresses || [])
-    ].filter(Boolean);
+    const existingAll = [abExisting?.PreferredAddress, ...(abExisting?.Addresses || [])].filter(Boolean);
     const existingSig = new Set(existingAll.map(sigNoBusiness));
 
-    // DEDUPE inside file
+    // dédoublonnage interne du fichier import
     const seen = new Set();
     const unique = [];
     for (const a of addresses) {
-      const k = a.AddressId ? `id:${a.AddressId}` : `k:${sigNoBusiness(a)}`;
-      if (seen.has(k)) continue;
-      seen.add(k);
+      const key = a.AddressId ? `id:${a.AddressId}` : `k:${sigNoBusiness(a)}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
       unique.push(a);
     }
 
@@ -351,8 +401,9 @@ else return res.status(400).json({ error: "Format non supporté (csv uniquement)
 
     for (let i = 0; i < unique.length; i++) {
       const addr = unique[i];
+
       try {
-        // SKIP duplicates already in addressbook (only for rows without AddressId)
+        // si pas d'AddressId, on SKIP si déjà existant (signature sans business)
         if (!addr.AddressId) {
           const s = sigNoBusiness(addr);
           if (existingSig.has(s)) {
@@ -368,10 +419,12 @@ else return res.status(400).json({ error: "Format non supporté (csv uniquement)
 
         const r = await upsertAddress(client, sd, userId, addr);
 
-        if (r.mode === "updated") updatedCount++;
-        else {
+        if (r.mode === "updated") {
+          updatedCount++;
+        } else {
           createdCount++;
-          existingSig.add(sigNoBusiness(addr)); // avoid duplicates in same run
+          // important: dès qu'on crée, on ajoute la signature pour éviter doublons dans la même run
+          existingSig.add(sigNoBusiness(addr));
         }
       } catch (e) {
         errors.push({
@@ -395,11 +448,17 @@ else return res.status(400).json({ error: "Format non supporté (csv uniquement)
       errors
     });
   } catch (e) {
-    return next(e);
+    console.error(e);
+    return res.status(500).json({ error: e.message || "Erreur import-file" });
   }
 });
 
-// Validate distribution list: ensure each address exists (create if missing), return addressId
+/**
+ * Validate addresses for distribution list
+ * - merge duplicates
+ * - ensure each address exists in addressbook (create if missing)
+ * - return addressId per line
+ */
 function mergeDuplicates(list) {
   if (!Array.isArray(list)) return [];
   const map = new Map();
@@ -408,9 +467,9 @@ function mergeDuplicates(list) {
     const zip = (r?.zip || r?.Postal || "").toString().trim();
     const city = (r?.city || r?.City || "").toString().trim();
     const country = (r?.country || r?.Country || "FR").toString().trim().toUpperCase();
-    const qty = Number(r?.qty || r?.quantity || 1) || 1;
+    const qty = Number(r?.qty || r?.quantity || 0) || 0;
+    if (!address || !zip || !city || qty <= 0) continue;
 
-    if (!address || !zip || !city) continue;
     const key = `${norm(address)}|${norm(zip)}|${norm(city)}|${norm(country)}`;
     const prev = map.get(key) || { address, zip, city, country, qty: 0 };
     prev.qty += qty;
@@ -419,7 +478,7 @@ function mergeDuplicates(list) {
   return [...map.values()];
 }
 
-app.post("/validate-addresses", async (req, res, next) => {
+app.post("/validate-addresses", async (req, res) => {
   try {
     const { userEmail, siteDomain, distributionList } = req.body || {};
     if (!userEmail) return res.status(400).json({ error: "userEmail requis" });
@@ -435,12 +494,10 @@ app.post("/validate-addresses", async (req, res, next) => {
     const ab = await getAddressBook(client, sd, userId);
     const preferred = ab?.PreferredAddress || null;
 
-    // map existing by signature
     const existingAll = [ab?.PreferredAddress, ...(ab?.Addresses || [])].filter(Boolean);
     const existingSigToId = new Map();
     for (const a of existingAll) {
-      const id = a?.AddressId;
-      if (id) existingSigToId.set(sigNoBusiness(a), id);
+      if (a?.AddressId) existingSigToId.set(sigNoBusiness(a), a.AddressId);
     }
 
     const validated = [];
@@ -469,12 +526,15 @@ app.post("/validate-addresses", async (req, res, next) => {
 
     return res.json({ ok: true, userId, validated });
   } catch (e) {
-    return next(e);
+    console.error(e);
+    return res.status(500).json({ error: e.message || "Erreur" });
   }
 });
 
-// Export CSV
-app.get("/addressbook/export.csv", async (req, res, next) => {
+/**
+ * Export CSV
+ */
+app.get("/addressbook/export.csv", async (req, res) => {
   try {
     const { userEmail, siteDomain } = req.query || {};
     if (!userEmail) return res.status(400).send("userEmail requis");
@@ -483,70 +543,211 @@ app.get("/addressbook/export.csv", async (req, res, next) => {
 
     const token = await authenticate();
     const client = api(token);
+
     const userId = await getUserId(client, sd, userEmail);
     const ab = await getAddressBook(client, sd, userId);
 
-    const preferred = ab?.PreferredAddress || null;
-    const addresses = ab?.Addresses || [];
+    const preferred = ab?.PreferredAddress ? [{ ...ab.PreferredAddress, IsPreferred: true }] : [];
+    const addresses = (ab?.Addresses || []).map(a => ({ ...a, IsPreferred: false }));
 
-    // dedupe by AddressId
-    const map = new Map();
-    for (const a of [preferred, ...addresses].filter(Boolean)) {
-      const id = a?.AddressId;
-      if (id && !map.has(id)) map.set(id, a);
-    }
-    const unique = [...map.values()];
+    const rows = [...preferred, ...addresses].map(a => ({
+      AddressId: a.AddressId || "",
+      Business: a.Business || "",
+      FirstName: a.FirstName || "",
+      LastName: a.LastName || "",
+      Title: a.Title || "",
+      Address1: a.Address1 || "",
+      Address2: a.Address2 || "",
+      Address3: a.Address3 || "",
+      City: a.City || "",
+      StateProvince: a.StateProvince || "",
+      Postal: a.Postal || "",
+      Country: a.Country || "",
+      Phone: a.Phone || "",
+      Email: a.Email || "",
+      IsPreferred: a.IsPreferred ? "true" : "false",
+      Qty: ""
+    }));
 
     const headers = [
       "AddressId","Business","FirstName","LastName","Title",
       "Address1","Address2","Address3","City","StateProvince",
-      "Postal","Country","Phone","Email","IsPreferred"
+      "Postal","Country","Phone","Email","IsPreferred","Qty"
     ];
 
-    const lines = [headers.join(",")];
-    for (const a of unique) {
-      const row = headers.map(h => {
-        const v = (h === "IsPreferred")
-          ? (a?.AddressId && preferred?.AddressId && a.AddressId === preferred.AddressId ? "true" : "false")
-          : (a?.[h] ?? "");
-        const s = String(v).replace(/"/g, '""');
-        return `"${s}"`;
-      });
-      lines.push(row.join(","));
-    }
+    const csv = toCsv(rows, headers);
 
     res.setHeader("Content-Type", "text/csv; charset=utf-8");
-    res.setHeader("Content-Disposition", `attachment; filename="addressbook.csv"`);
-    return res.send(lines.join("\n"));
+    res.setHeader("Content-Disposition", 'attachment; filename="addressbook.csv"');
+    return res.send(csv);
   } catch (e) {
-    return next(e);
+    console.error(e);
+    return res.status(500).send(e.message || "Erreur");
   }
 });
 
-// Export XLSX (désactivé pour raisons de sécurité)
-app.get("/addressbook/export.xlsx", (req, res) => {
-  return res.status(410).json({
-    ok: false,
-    error: "XLSX export disabled for security. Use /addressbook/export.csv"
-  });
+/**
+ * Export XLSX (ExcelJS) — on garde comme avant (fonctionnel)
+ */
+app.get("/addressbook/export.xlsx", async (req, res) => {
+  try {
+    const { userEmail, siteDomain } = req.query || {};
+    if (!userEmail) return res.status(400).send("userEmail requis");
+    const sd = assertSiteDomain(siteDomain);
+
+    const token = await authenticate();
+    const client = api(token);
+
+    const userId = await getUserId(client, sd, userEmail);
+    const ab = await getAddressBook(client, sd, userId);
+
+    const preferred = ab?.PreferredAddress
+      ? [{ ...ab.PreferredAddress, IsPreferred: true }]
+      : [];
+    const addresses = (ab?.Addresses || []).map(a => ({ ...a, IsPreferred: false }));
+
+    const rows = [...preferred, ...addresses].map(a => ({
+      AddressId: a.AddressId || "",
+      Business: a.Business || "",
+      FirstName: a.FirstName || "",
+      LastName: a.LastName || "",
+      Title: a.Title || "",
+      Address1: a.Address1 || "",
+      Address2: a.Address2 || "",
+      Address3: a.Address3 || "",
+      City: a.City || "",
+      StateProvince: a.StateProvince || "",
+      Postal: a.Postal || "",
+      Country: a.Country || "",
+      Phone: a.Phone || "",
+      Email: a.Email || "",
+      IsPreferred: a.IsPreferred ? "true" : "false",
+      Qty: ""
+    }));
+
+    const wb = new ExcelJS.Workbook();
+    wb.creator = "cart-orchestrator";
+    wb.created = new Date();
+
+    const ws = wb.addWorksheet("Addressbook", {
+      views: [{ state: "frozen", ySplit: 1 }]
+    });
+
+    ws.columns = [
+      { header: "AddressId", key: "AddressId", width: 36 },
+      { header: "Business", key: "Business", width: 24 },
+      { header: "FirstName", key: "FirstName", width: 16 },
+      { header: "LastName", key: "LastName", width: 16 },
+      { header: "Title", key: "Title", width: 16 },
+      { header: "Address1", key: "Address1", width: 34 },
+      { header: "Address2", key: "Address2", width: 22 },
+      { header: "Address3", key: "Address3", width: 22 },
+      { header: "City", key: "City", width: 18 },
+      { header: "StateProvince", key: "StateProvince", width: 18 },
+      { header: "Postal", key: "Postal", width: 12 },
+      { header: "Country", key: "Country", width: 10 },
+      { header: "Phone", key: "Phone", width: 18 },
+      { header: "Email", key: "Email", width: 26 },
+      { header: "IsPreferred", key: "IsPreferred", width: 12 },
+      { header: "Qty", key: "Qty", width: 10 }
+    ];
+
+    ws.getRow(1).font = { bold: true };
+    ws.getRow(1).alignment = { vertical: "middle" };
+    ws.getRow(1).height = 18;
+
+    ws.addRows(rows);
+
+    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
+    res.setHeader("Content-Disposition", 'attachment; filename="addressbook.xlsx"');
+
+    await wb.xlsx.write(res);
+    res.end();
+  } catch (e) {
+    console.error(e);
+    return res.status(500).send(e.message || "Erreur");
+  }
 });
 
-// -------------------- ERROR HANDLER (JSON lisible) --------------------
-app.use((err, req, res, next) => {
-  console.error("[SERVER ERROR]", err?.response?.data || err?.stack || err);
+/**
+ * Add to cart distribution (1 adresse = 1 item)
+ */
+app.post("/add-to-cart-distribution", async (req, res) => {
+  try {
+    const {
+      userEmail,
+      siteDomain,
+      urlName,
+      shippingMethod,
+      pricingOptions,
+      otherQuantities,
+      lines
+    } = req.body || {};
 
-  const status = err?.response?.status || err?.statusCode || 500;
-  const upstream = err?.response?.data || null;
+    if (!userEmail || !siteDomain || !urlName || !shippingMethod)
+      return res.status(400).json({ error: "userEmail, siteDomain, urlName, shippingMethod requis" });
 
-  res.status(status).json({
-    ok: false,
-    error: err?.message || "server_error",
-    status,
-    upstream
-  });
+    if (!Array.isArray(pricingOptions) || !pricingOptions.length)
+      return res.status(400).json({ error: "pricingOptions manquant" });
+
+    if (!Array.isArray(lines) || !lines.length)
+      return res.status(400).json({ error: "lines manquant" });
+
+    const sd = assertSiteDomain(siteDomain);
+    const oq = Array.isArray(otherQuantities) ? otherQuantities : [];
+
+    const token = await authenticate();
+    const client = api(token);
+
+    const userId = await getUserId(client, sd, userEmail);
+    const cartId = await getCartId(client, sd, userId);
+    const productId = await resolveProductId(client, sd, urlName);
+
+    const results = [];
+
+    for (const row of lines) {
+      const qty = parseInt(row.qty, 10) || 0;
+      if (!qty) continue;
+
+      const quantities = [qty, ...oq];
+
+      const payload = {
+        ProductId: productId,
+        ShipTo: row.addressId,
+        ShippingMethod: shippingMethod,
+        PricingParameters: { Quantities: quantities, Options: pricingOptions },
+        ItemName: "Distribution",
+        Notes: row.label || ""
+      };
+
+      try {
+        const r = await client.post(
+          `/api/cart/${sd}/${cartId}/item/`,
+          payload,
+          { params: { userId } }
+        );
+        results.push({ addressId: row.addressId, qty, status: r.status, ok: true });
+      } catch (err) {
+        const status = err?.response?.status;
+        const msg = err?.response?.data?.Message || err?.response?.data?.message || err?.message;
+
+        if (status === 400 && msg === "ReOrderFullSuccess_PriceWarning") {
+          results.push({ addressId: row.addressId, qty, status, ok: true, warning: msg });
+          continue;
+        }
+        throw err;
+      }
+    }
+
+    const added = results.filter(r => r.ok).length;
+    const warnings = results.filter(r => r.warning).length;
+
+    return res.json({ ok: true, cartId, added, warnings, results });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: e.message });
+  }
 });
 
-// -------------------- START --------------------
-app.listen(PORT, () => {
-  console.log(`cart-orchestrator listening on :${PORT}`);
-});
+const port = process.env.PORT || 10000;
+app.listen(port, () => console.log(`cart-orchestrator listening on :${port}`));
