@@ -17,13 +17,46 @@ app.use(cors({
     } catch {}
     return cb(new Error("Not allowed by CORS"));
   },
-  methods: ["GET","POST","OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"],
+  methods: ["GET","POST","PUT","DELETE","OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization", "X-Requested-With"],
   credentials: false
 }));
+
+app.options("*", cors());
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 15 * 1024 * 1024 } // 15MB
+});
+app.set("trust proxy", true);
+
+// CORS (autorise Pressero + dev)
+const ALLOWED_ORIGINS = [
+  "https://decoration.ams.v6.pressero.com",
+  "https://admin.ams.v6.pressero.com"
+];
+
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+
+  // Autorise aussi tous les sous-domaines *.pressero.com
+  const ok =
+    (origin && ALLOWED_ORIGINS.includes(origin)) ||
+    (origin && /^https:\/\/.*\.pressero\.com$/i.test(origin));
+
+  if (ok) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+    res.setHeader("Access-Control-Allow-Credentials", "true");
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With");
+    res.setHeader("Access-Control-Allow-Methods", "GET,POST,PUT,DELETE,OPTIONS");
+  }
+
+  // Preflight
+  if (req.method === "OPTIONS") {
+    return res.status(204).end();
+  }
+
+  next();
 });
 
 
@@ -375,7 +408,7 @@ for (let i = 0; i < unique.length; i++) {
 }
 
 // 200 même s’il y a des erreurs, avec rapport
-res.json({
+return res.json({
   ok: errors.length === 0,
   totalParsed: addresses.length,
   totalImported: unique.length,
@@ -384,18 +417,10 @@ res.json({
   errorCount: errors.length,
   errors
 });
-
-    res.json({
-      ok: true,
-      totalParsed: addresses.length,
-      totalImported: unique.length,
-      createdCount,
-      updatedCount
-    });
   } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: e.message || "Erreur import-file" });
-  }
+  console.error(e);
+  return res.status(500).json({ error: e.message || "Erreur import-file" });
+}
 });
 
 
