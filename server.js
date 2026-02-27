@@ -3,7 +3,7 @@ import express from "express";
 import axios from "axios";
 import cors from "cors";
 import multer from "multer";
-import XLSX from "xlsx";
+
 
 // -------------------- CONFIG --------------------
 const PORT = process.env.PORT || 10000;
@@ -242,15 +242,6 @@ function normalizeRowToAddress(row) {
   return addr;
 }
 
-async function parseXlsxBuffer(buf) {
-  const wb = XLSX.read(buf, { type: "buffer" });
-  const sheetName = wb.SheetNames[0];
-  const ws = wb.Sheets[sheetName];
-  const rows = XLSX.utils.sheet_to_json(ws, { defval: "" });
-  const addresses = rows.map(normalizeRowToAddress)
-    .filter(a => a.Address1 && a.City && a.Postal && a.Country);
-  return addresses;
-}
 
 async function parseCsvBuffer(buf) {
   const txt = buf.toString("utf-8");
@@ -322,8 +313,7 @@ app.post("/addressbook/import-file", upload.single("file"), async (req, res, nex
 
     let addresses = [];
     if (ext === "csv") addresses = await parseCsvBuffer(f.buffer);
-    else if (ext === "xlsx" || ext === "xls") addresses = await parseXlsxBuffer(f.buffer);
-    else return res.status(400).json({ error: "Format non supporté (csv/xlsx)" });
+else return res.status(400).json({ error: "Format non supporté (csv uniquement)" });
 
     if (!addresses.length) {
       return res.status(400).json({ error: "Aucune ligne valide trouvée dans le fichier." });
@@ -533,59 +523,12 @@ app.get("/addressbook/export.csv", async (req, res, next) => {
   }
 });
 
-// Export XLSX
-app.get("/addressbook/export.xlsx", async (req, res, next) => {
-  try {
-    const { userEmail, siteDomain } = req.query || {};
-    if (!userEmail) return res.status(400).send("userEmail requis");
-
-    const sd = assertSiteDomain(siteDomain);
-
-    const token = await authenticate();
-    const client = api(token);
-    const userId = await getUserId(client, sd, userEmail);
-    const ab = await getAddressBook(client, sd, userId);
-
-    const preferred = ab?.PreferredAddress || null;
-    const addresses = ab?.Addresses || [];
-
-    // dedupe by AddressId
-    const map = new Map();
-    for (const a of [preferred, ...addresses].filter(Boolean)) {
-      const id = a?.AddressId;
-      if (id && !map.has(id)) map.set(id, a);
-    }
-    const unique = [...map.values()];
-
-    const rows = unique.map(a => ({
-      AddressId: a?.AddressId || "",
-      Business: a?.Business || "",
-      FirstName: a?.FirstName || "",
-      LastName: a?.LastName || "",
-      Title: a?.Title || "",
-      Address1: a?.Address1 || "",
-      Address2: a?.Address2 || "",
-      Address3: a?.Address3 || "",
-      City: a?.City || "",
-      StateProvince: a?.StateProvince || "",
-      Postal: a?.Postal || "",
-      Country: a?.Country || "",
-      Phone: a?.Phone || "",
-      Email: a?.Email || "",
-      IsPreferred: (a?.AddressId && preferred?.AddressId && a.AddressId === preferred.AddressId)
-    }));
-
-    const wb = XLSX.utils.book_new();
-    const ws = XLSX.utils.json_to_sheet(rows);
-    XLSX.utils.book_append_sheet(wb, ws, "AddressBook");
-    const buf = XLSX.write(wb, { type: "buffer", bookType: "xlsx" });
-
-    res.setHeader("Content-Type", "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet");
-    res.setHeader("Content-Disposition", `attachment; filename="addressbook.xlsx"`);
-    return res.send(buf);
-  } catch (e) {
-    return next(e);
-  }
+// Export XLSX (désactivé pour raisons de sécurité)
+app.get("/addressbook/export.xlsx", (req, res) => {
+  return res.status(410).json({
+    ok: false,
+    error: "XLSX export disabled for security. Use /addressbook/export.csv"
+  });
 });
 
 // -------------------- ERROR HANDLER (JSON lisible) --------------------
