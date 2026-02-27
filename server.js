@@ -70,28 +70,27 @@ function requireEnv() {
 async function authenticate() {
   requireEnv();
 
-  // ⚠️ Endpoint d’auth Pressero : garde le tien si différent
-  // Ici: /api/public/authenticate est courant sur des APIs Aleyant (PJM).
-  // Certains tenants Pressero utilisent /api/public/authenticate ou /api/public/authentication/token.
-  // => fallback multi endpoints.
   const candidates = [
     "/api/public/authenticate",
-    "/api/public/authentication/token",
-    "/api/authenticate"
+    "/api/public/authentication/token"
+    // ⚠️ retire /api/authenticate (ça t’a déjà cassé)
   ];
-console.log("[AUTH] trying:", `${ADMIN_BASE}${path}`);
+
   let lastErr;
-  for (const path of candidates) {
+  for (const p of candidates) {
     try {
-      const r = await axios.post(`${ADMIN_BASE}${path}`, {
-        UserName: ADMIN_USER,
-        Password: ADMIN_PASS
-      }, { timeout: 20000 });
+      console.log("[AUTH] trying:", `${ADMIN_BASE}${p}`);
+
+      const r = await axios.post(
+        `${ADMIN_BASE}${p}`,
+        { UserName: ADMIN_USER, Password: ADMIN_PASS },
+        { timeout: 20000 }
+      );
+
       const token = r?.data?.Token || r?.data?.token || r?.data?.AuthToken || r?.data;
       if (token && typeof token === "string") return token;
-      // Certains renvoient { token: "..." } etc.
-      if (r?.data?.token && typeof r.data.token === "string") return r.data.token;
-      lastErr = new Error(`Auth OK mais token introuvable sur ${path}`);
+
+      lastErr = new Error(`Auth ok but token missing for ${p}`);
     } catch (e) {
       lastErr = e;
     }
