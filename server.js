@@ -10,6 +10,7 @@ const PORT = process.env.PORT || 10000;
 
 // Base admin Pressero
 const ADMIN_BASE = process.env.PRESSERO_ADMIN_BASE || "https://admin.ams.v6.pressero.com";
+console.log("[CFG] ADMIN_BASE =", ADMIN_BASE);
 
 // Identifiants (mets-les dans Render > Environment)
 const ADMIN_USER = process.env.PRESSERO_ADMIN_USER || process.env.ADMIN_USER || "";
@@ -78,7 +79,7 @@ async function authenticate() {
     "/api/public/authentication/token",
     "/api/authenticate"
   ];
-
+console.log("[AUTH] trying:", `${ADMIN_BASE}${path}`);
   let lastErr;
   for (const path of candidates) {
     try {
